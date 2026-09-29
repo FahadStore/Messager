@@ -1778,6 +1778,7 @@ function renderObAvatar() {
 function showOnboard() {
   $('#app').hidden = true;
   $('#onboard').hidden = false;
+  bootDone();
   renderSwatches($('#obColors'), obColor, (c) => { obColor = c; renderObAvatar(); });
   renderObAvatar();
   // من سجّل خروجه سابقًا يرى شاشة الدخول مباشرة
@@ -1804,6 +1805,7 @@ async function startApp() {
   }
   $('#onboard').hidden = true;
   $('#app').hidden = false;
+  bootDone();
   store.set(K.lastId, me.id);
   loadState();
   channel?.postMessage({ t: 'takeover' });
@@ -2083,7 +2085,19 @@ function bindUI() {
 }
 
 // ---------- البدء ----------
-applySettings();
-bindUI();
-if (me) startApp();
-else showOnboard();
+function bootDone() {
+  window.__booted = true;
+  clearTimeout(window.__bootT);
+  const b = $('#boot');
+  if (b) closeEl(b, () => b.remove());
+}
+
+try {
+  applySettings();
+  bindUI();
+  if (me) startApp();
+  else showOnboard();
+} catch (err) {
+  console.error(err);
+  window.__bootFail?.();
+}

@@ -971,6 +971,7 @@ button.mb-state { cursor: pointer; font: inherit; color: #fff; }
 .toast .ms { font-size: 19px; }
 
 .shake { animation: shake .4s var(--ease); }
+.boot.closing { animation: fadeOut .19s var(--ease) forwards; }
 
 /* ===== الحركة ===== */
 @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } }

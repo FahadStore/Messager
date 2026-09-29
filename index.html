@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add_photo_alternate,arrow_back,block,brightness_auto,chat,check,close,content_copy,dark_mode,delete,delete_sweep,done_all,download,edit_square,error,history,hourglass_top,info,key,keyboard_return,light_mode,lock,login,logout,more_vert,notifications,palette,password,person_add,photo_camera,photo_library,refresh,schedule,search,send,settings,share,shield,smart_toy,text_fields,verified,videocam,volume_up&display=block" />
-  <link rel="stylesheet" href="assets/style.css" />
+  <link rel="stylesheet" href="assets/style.css?v=7" />
   <script>
     // تطبيق الثيم قبل الرسم لتجنّب الوميض
     try {
@@ -20,9 +20,32 @@
       document.documentElement.dataset.theme = t;
       document.documentElement.dataset.font = s.fontSize || 'm';
     } catch (e) {}
+    // شاشة تحميل: إن تعذّر تشغيل التطبيق تظهر رسالة وزر إعادة تحميل بدل صفحة فارغة
+    window.__bootFail = function () {
+      if (window.__booted) return;
+      var m = document.getElementById('bootMsg');
+      if (m) m.hidden = false;
+    };
+    window.__bootT = setTimeout(window.__bootFail, 8000);
+    window.addEventListener('error', window.__bootFail);
   </script>
+  <style>
+    .boot { position: fixed; inset: 0; z-index: 100; display: grid; place-content: center; justify-items: center; gap: 18px; padding: 24px; text-align: center; background: var(--bg, #fff); color: var(--text, #111); font-family: system-ui, sans-serif; }
+    .boot .logo { width: 64px; height: 64px; animation: bootPulse 1.6s ease-in-out infinite; }
+    .boot p { margin: 0; }
+    .boot button { height: 44px; padding: 0 20px; border: 0; border-radius: 12px; background: var(--ink, #151517); color: var(--on-ink, #fff); font: inherit; font-weight: 600; cursor: pointer; }
+    @keyframes bootPulse { 50% { transform: scale(.94); opacity: .7; } }
+  </style>
 </head>
 <body>
+  <div class="boot" id="boot">
+    <span class="logo"><svg viewBox="0 0 96 96" aria-hidden="true"><rect class="lg-bg" width="96" height="96" rx="28"/><path class="lg-fg" d="M30 24h36a12 12 0 0 1 12 12v22a12 12 0 0 1-12 12H44l-12 10v-10h-2a12 12 0 0 1-12-12V36a12 12 0 0 1 12-12z"/><path class="lg-tk" d="M33 48l7 7 13-14M47 52l3 3 13-14"/></svg></span>
+    <div id="bootMsg" hidden>
+      <p>تعذّر تحميل مرسال.</p>
+      <p><button type="button" onclick="location.replace(location.pathname + '?r=' + Date.now())">إعادة التحميل</button></p>
+    </div>
+  </div>
+
   <!-- ========== التسجيل ========== -->
   <section class="onboard" id="onboard" hidden>
     <div class="ob-card">
@@ -296,6 +319,7 @@
   <div class="viewer" id="viewer" hidden></div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-  <script type="module" src="assets/app.js"></script>
+  <!-- غيّر رقم الإصدار ?v= مع كل تحديث حتى لا يخلط المتصفح ملفات قديمة بجديدة -->
+  <script type="module" src="assets/app.js?v=7"></script>
 </body>
 </html>
