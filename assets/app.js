@@ -26,11 +26,19 @@ const RESEND_AFTER = 11 * 3600e3; // ntfy.sh يحتفظ بالرسائل 12 سا
 const RESEND_MAX_AGE = 7 * 864e5;
 const PROFILE_EVERY = 3 * 3600e3;
 const DEMO_ID = 'demo';
+const VERIFIED = new Set(['F77SEZRZW2']); // حسابات موثّقة
+const AV_MAX = 2300; // الصورة الشخصية صغيرة لتتسع داخل رسالة مشفّرة (حد ntfy هو 4096 بايت)
+const KDF_ITER = 600000;
+const VAULT_EVERY = 6 * 3600e3;
 const AV_COLORS = ['stone', 'sand', 'sage', 'sky', 'lilac', 'rose'];
 const COLOR_NAMES = { stone: 'رمادي', sand: 'رملي', sage: 'أخضر', sky: 'سماوي', lilac: 'بنفسجي', rose: 'وردي' };
 const MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif', 'video/mp4', 'video/webm', 'video/quicktime', 'video/ogg'];
 const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
-const K = { id: 'mrsl.identity', state: 'mrsl.state', settings: 'mrsl.settings' };
+const K = { id: 'mrsl.identity', settings: 'mrsl.settings', legacyState: 'mrsl.state', lastId: 'mrsl.lastId' };
+// بيانات كل حساب منفصلة حتى يمكن تسجيل الخروج والدخول بحساب آخر على نفس الجهاز
+const stateKey = (id) => `mrsl.state.${id}`;
+const vaultKey = (id) => `mrsl.vault.${id}`;
+const profKey = (id) => `mrsl.profile.${id}`;
 const DEFAULTS = {
   theme: 'system',
   fontSize: 'm',
@@ -38,6 +46,7 @@ const DEFAULTS = {
   notify: false,
   sound: true,
   enterSend: !matchMedia('(pointer: coarse)').matches,
+  protect: true,
 };
 const RANK = { failed: 0, sending: 0, sent: 1, delivered: 2, read: 3 };
 const ERR = {
@@ -90,7 +99,7 @@ const idb = (() => {
 })();
 
 let me = store.get(K.id, null);
-let state = normalizeState(store.get(K.state, null));
+let state = normalizeState(null);
 let settings = { ...DEFAULTS, ...store.get(K.settings, {}) };
 let privKey = null;
 let es = null;
@@ -150,7 +159,57 @@ const initial = (name) => ([...String(name || '').trim()][0] || '؟').toUpperCas
 const displayName = (c) => c.name || `مستخدم ${c.id.slice(0, 5)}`;
 const idLabel = (c) => (c.bot ? 'حساب تجريبي' : formatId(c.id));
 const isMobile = () => matchMedia('(max-width: 760px)').matches;
-const avatar = (name, color, cls = '') => `<div class="av av-${AV_COLORS.includes(color) ? color : 'stone'} ${cls}">${esc(initial(name))}</div>`;
+const validAvatar = (s) => typeof s === 'string' && s.length <= AV_MAX + 40 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(s);
+const avatar = (name, color, cls = '', img = '') => `<div class="av av-${AV_COLORS.includes(color) ? color : 'stone'} ${cls}">${validAvatar(img) ? `<img src="${img}" alt="" draggable="false">` : esc(initial(name))}</div>`;
+const isVerified = (id) => VERIFIED.has(id);
+const badge = (id) => (isVerified(id) ? '<span class="ms fill verified" title="حساب موثّق" aria-label="حساب موثّق">verified</span>' : '');
+const nameHtml = (name, id) => `<span class="nm">${esc(name)}</span>${badge(id)}`;
+const who = () => ({ n: me.name, c: me.color, ah: me.ah || '' });
+const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// إظهار وإخفاء بحركة ناعمة (الإخفاء ينتظر انتهاء حركة الخروج)
+function openEl(el) {
+  clearTimeout(el._hideT);
+  el.classList.remove('closing');
+  el.hidden = false;
+}
+function closeEl(el, then) {
+  if (el.hidden) return then?.();
+  clearTimeout(el._hideT);
+  el.classList.add('closing');
+  el._hideT = setTimeout(() => { el.classList.remove('closing'); el.hidden = true; then?.(); }, reduceMotion() ? 0 : 190);
+}
+
+async function avatarHash(av) {
+  if (!av) return '';
+  return b64e(new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(av)))).slice(0, 12);
+}
+
+// قص الصورة مربعًا وتصغيرها لتصبح صورة شخصية خفيفة
+async function makeAvatar(file) {
+  if (!file.type.startsWith('image/')) throw new Error('type');
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await loadImage(url).catch(() => { throw new Error('decode'); });
+    const w = img.naturalWidth, h = img.naturalHeight, side = Math.min(w, h);
+    for (const size of [88, 72, 56]) {
+      const cv = document.createElement('canvas');
+      cv.width = cv.height = size;
+      const ctx = cv.getContext('2d');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, size, size);
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, (w - side) / 2, (h - side) / 2, side, side, 0, 0, size, size);
+      for (const q of [0.82, 0.7, 0.58, 0.46]) {
+        const d = cv.toDataURL('image/jpeg', q);
+        if (d.length <= AV_MAX) return d;
+      }
+    }
+    throw new Error('too_big');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const clampInt = (v, max = 20000) => (Number.isFinite(+v) ? Math.max(0, Math.min(max, Math.round(+v))) : 0);
 
@@ -228,6 +287,80 @@ async function parseBackup(str) {
   return { id: d.id, name: cleanName(d.name) || 'أنا', color: AV_COLORS.includes(d.color) ? d.color : 'stone', pub: d.pub, priv: d.priv, created: Date.now() };
 }
 
+// ---------- كلمة المرور ----------
+// المفتاح الخاص يُشفَّر بكلمة المرور (PBKDF2 + AES-GCM) ويُحفظ على الجهاز وعلى ntfy،
+// فيمكن الدخول بالمعرّف وكلمة المرور. ntfy يحتفظ بالنسخة 12 ساعة وتُجدَّد كلما فُتح الحساب.
+async function deriveKey(password, salt, iterations) {
+  const base = await crypto.subtle.importKey('raw', te.encode(password.normalize('NFKC')), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+async function makeVault(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(password, salt, KDF_ITER);
+  const data = te.encode(JSON.stringify({ id: me.id, name: me.name, color: me.color, pub: me.pub, priv: me.priv }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(me.id) }, key, data));
+  return { v: 1, id: me.id, it: KDF_ITER, s: b64e(salt), iv: b64e(iv), ct: b64e(ct) };
+}
+
+async function openVault(vault, password) {
+  if (!vault || vault.v !== 1 || !validId(vault.id)) throw new Error('bad');
+  const it = clampInt(vault.it, 5e6);
+  if (it < 100000) throw new Error('bad');
+  const key = await deriveKey(password, b64d(vault.s), it);
+  let pt;
+  try {
+    pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(vault.iv), additionalData: te.encode(vault.id) }, key, b64d(vault.ct));
+  } catch { throw new Error('password'); }
+  const d = JSON.parse(td.decode(pt));
+  if (d.id !== vault.id || await idFromPub(b64d(d.pub)) !== d.id) throw new Error('bad');
+  await crypto.subtle.importKey('jwk', d.priv, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  return { id: d.id, name: cleanName(d.name) || 'أنا', color: AV_COLORS.includes(d.color) ? d.color : 'stone', pub: d.pub, priv: d.priv, created: Date.now() };
+}
+
+const vaultTopic = (id) => `${NS}-acct-${id.toLowerCase()}`;
+
+async function publishVault(force = false) {
+  const vault = me && store.get(vaultKey(me.id), null);
+  if (!vault || suspended) return;
+  if (!force && Date.now() - (state.vaultAt || 0) < VAULT_EVERY) return;
+  try {
+    await publish(vaultTopic(me.id), JSON.stringify(vault));
+    state.vaultAt = Date.now();
+    save();
+  } catch {}
+}
+
+async function fetchRemoteVault(id) {
+  let res;
+  try { res = await fetch(`${NTFY}/${vaultTopic(id)}/json?poll=1&since=all`); } catch { throw new Error('network'); }
+  if (!res.ok) throw new Error('network');
+  const lines = (await res.text()).trim().split('\n').reverse();
+  for (const line of lines) {
+    try {
+      const ev = JSON.parse(line);
+      if (ev.event !== 'message') continue;
+      const v = JSON.parse(ev.message);
+      if (v.v === 1 && v.id === id) return v;
+    } catch {}
+  }
+  return null;
+}
+
+async function login(id, password) {
+  const local = store.get(vaultKey(id), null);
+  if (local) {
+    try { return { ident: await openVault(local, password), vault: local }; } catch (err) {
+      if (err.message !== 'password') throw err;
+    }
+  }
+  // كلمة المرور ربما تغيّرت من جهاز آخر، أو هذا جهاز جديد
+  const remote = await fetchRemoteVault(id).catch((e) => { if (!local) throw e; return null; });
+  if (!remote) throw new Error(local ? 'password' : 'missing');
+  return { ident: await openVault(remote, password), vault: remote };
+}
+
 // ---------- الشبكة ----------
 const inboxTopic = (id) => `${NS}-in-${id.toLowerCase()}`;
 const profileTopic = (id) => `${NS}-p-${id.toLowerCase()}`;
@@ -254,7 +387,10 @@ async function publishProfile(force = false) {
   if (!me || suspended) return;
   if (!force && Date.now() - (state.profileAt || 0) < PROFILE_EVERY) return;
   try {
-    await publish(profileTopic(me.id), JSON.stringify({ v: 1, id: me.id, k: me.pub, n: me.name, c: me.color }));
+    const prof = { v: 1, id: me.id, k: me.pub, n: me.name, c: me.color };
+    let body = JSON.stringify({ ...prof, av: me.av || undefined });
+    if (body.length > 3900) body = JSON.stringify(prof);
+    await publish(profileTopic(me.id), body);
     state.profileAt = Date.now();
     save();
   } catch {}
@@ -272,7 +408,7 @@ async function lookupProfile(id) {
       const p = JSON.parse(ev.message);
       if (p.v !== 1 || p.id !== id || typeof p.k !== 'string') continue;
       if (await idFromPub(b64d(p.k)) !== id) continue;
-      return { id, pub: p.k, name: cleanName(p.n), color: AV_COLORS.includes(p.c) ? p.c : 'stone' };
+      return { id, pub: p.k, name: cleanName(p.n), color: AV_COLORS.includes(p.c) ? p.c : 'stone', av: validAvatar(p.av) ? p.av : '' };
     } catch {}
   }
   return null;
@@ -393,7 +529,7 @@ async function requestResend(c, m) {
   m.media.st = 'requested';
   save();
   refreshMedia(c, m);
-  try { await sendEnvelope(c, { t: 'q', id: m.id, n: me.name, c: me.color }); } catch {
+  try { await sendEnvelope(c, { t: 'q', id: m.id, ...who() }); } catch {
     m.media.st = 'expired';
     save();
     refreshMedia(c, m);
@@ -462,7 +598,7 @@ function parseMediaWire(a) {
 }
 
 function onInner(fromId, pub, inner, evTime) {
-  if (!inner || !['m', 'r', 'q'].includes(inner.t)) return;
+  if (!inner || !['m', 'r', 'q', 'p', 'pa'].includes(inner.t)) return;
   let c = state.contacts[fromId];
   if (c?.blocked) return;
   if (!c) {
@@ -472,9 +608,20 @@ function onInner(fromId, pub, inner, evTime) {
   const n = cleanName(inner.n);
   if (n) c.name = n;
   if (AV_COLORS.includes(inner.c)) c.color = inner.c;
+  if (inner.t !== 'p' && typeof inner.ah === 'string') syncAvatar(c, inner.ah);
 
   if (inner.t === 'r') {
     applyReceipt(c, inner);
+  } else if (inner.t === 'p') {
+    // صورة شخصية جديدة من الطرف الآخر
+    c.av = validAvatar(inner.av) ? inner.av : '';
+    c.ah = c.av && typeof inner.ah === 'string' ? inner.ah.slice(0, 16) : '';
+  } else if (inner.t === 'pa') {
+    // الطرف الآخر يطلب صورتي
+    if (Date.now() - (c.avSentAt || 0) > 60e3) {
+      c.avSentAt = Date.now();
+      sendEnvelope(c, { t: 'p', av: me.av || '', ...who() }).catch(() => {});
+    }
   } else if (inner.t === 'q') {
     // طلب إعادة رفع مرفق انتهت صلاحيته عند الطرف الآخر
     const m = c.msgs.find((x) => x.me && x.id === inner.id && x.media);
@@ -498,6 +645,7 @@ function onInner(fromId, pub, inner, evTime) {
       save();
       return;
     }
+    if (media) media.pr = inner.a?.pr ? 1 : 0;
     let ts = Number(inner.s);
     if (!Number.isFinite(ts) || ts > evTime + 5 * 60e3 || ts < evTime - RESEND_MAX_AGE - 864e5) ts = evTime;
     const m = { id, me: false, text, ts };
@@ -528,6 +676,26 @@ function receive(c, m, { fresh = true } = {}) {
   save();
   renderList();
   updateTitle();
+}
+
+function syncAvatar(c, ah) {
+  if (c.bot || ah === (c.ah || '')) return;
+  if (!ah) { c.av = ''; c.ah = ''; return; }
+  if (Date.now() - (c.avReqAt || 0) < 10 * 60e3) return;
+  c.avReqAt = Date.now();
+  sendEnvelope(c, { t: 'pa', ...who() }).catch(() => {});
+}
+
+// إرسال صورتي الجديدة لمن أراسلهم مؤخرًا
+async function pushAvatar() {
+  const recent = Object.values(state.contacts)
+    .filter((c) => !c.bot && !c.blocked && Date.now() - (c.updated || 0) < 30 * 864e5)
+    .sort((a, b) => b.updated - a.updated)
+    .slice(0, 15);
+  for (const c of recent) {
+    c.avSentAt = Date.now();
+    await sendEnvelope(c, { t: 'p', av: me.av || '', ...who() }).catch(() => {});
+  }
 }
 
 function applyReceipt(c, inner) {
@@ -568,7 +736,7 @@ async function flushReceipts(peerId) {
   if (!p || !c || c.blocked || c.bot || suspended) return;
   const d = [...p.d].slice(-100), r = [...p.r].slice(-100);
   if (!d.length && !r.length) return;
-  try { await sendEnvelope(c, { t: 'r', d, r, n: me.name, c: me.color }); } catch {}
+  try { await sendEnvelope(c, { t: 'r', d, r, ...who() }); } catch {}
 }
 
 // ---------- الرسائل ----------
@@ -610,10 +778,10 @@ function sendCurrent() {
   deliver(c, m);
 }
 
-async function sendMedia(c, prep, caption) {
+async function sendMedia(c, prep, caption, protect) {
   const m = {
     id: rid(), me: true, text: caption, ts: Date.now(), status: 'sending',
-    media: { kind: prep.kind, mime: prep.mime, w: prep.w, h: prep.h, thumb: prep.thumb, dur: prep.dur, size: prep.blob.size },
+    media: { kind: prep.kind, mime: prep.mime, w: prep.w, h: prep.h, thumb: prep.thumb, dur: prep.dur, size: prep.blob.size, pr: protect ? 1 : 0 },
   };
   putBlob(m.id, prep.blob);
   insertMsg(c, m);
@@ -627,11 +795,11 @@ async function deliver(c, m, { quiet = false, reupload = false } = {}) {
   if (c.bot) return botHandle(c, m);
   if (!quiet) { m.status = 'sending'; refreshMsg(c, m); }
   try {
-    const inner = { t: 'm', id: m.id, x: m.text, s: m.ts, n: me.name, c: me.color };
+    const inner = { t: 'm', id: m.id, x: m.text, s: m.ts, ...who() };
     if (m.media) {
       if (reupload || !m.media.us || Date.now() - (m.media.upAt || 0) > MEDIA_TTL) await uploadMedia(m);
       const md = m.media;
-      inner.a = { k: md.kind, m: md.mime, w: md.w, h: md.h, t: md.thumb, d: md.dur, z: md.size, us: md.us, key: md.key, iv: md.iv };
+      inner.a = { k: md.kind, m: md.mime, w: md.w, h: md.h, t: md.thumb, d: md.dur, z: md.size, us: md.us, key: md.key, iv: md.iv, pr: md.pr ? 1 : 0 };
     }
     try {
       await sendEnvelope(c, inner);
@@ -768,8 +936,8 @@ async function pickFile(file) {
   toast('جارٍ تجهيز الملف…', 'hourglass_top', 20000);
   try { prep = await prepareMedia(file); } catch (err) { return toast(ERR[err.message] || ERR.decode, 'error'); }
   hideToast();
-  const caption = await previewDialog(prep);
-  if (caption !== null) sendMedia(c, prep, caption);
+  const res = await previewDialog(prep);
+  if (res) sendMedia(c, prep, res.caption, res.protect);
 }
 
 // ---------- الحساب التجريبي ----------
@@ -827,7 +995,8 @@ function botReply(c, m) {
   const t = String(m.text || '').replace(/[ً-ْـ]/g, '').toLowerCase();
   const has = (...w) => w.some((x) => t.includes(x));
   let text = '', image = false;
-  if (m.media) text = m.media.kind === 'image' ? pick(['صورة حلوة! 📸 وصلتني بدون مشاكل.', 'وصلت الصورة ✅ شفت كيف تتحمّل؟']) : pick(['وصلني الفيديو 🎬 شغّال تمام!', 'فيديو رهيب! 👌 وصل كامل.']);
+  if (m.media?.pr) text = 'وصلت محمية 🛡️ — ما أقدر أشوفها إلا وأنا ضاغط عليها، وعليها اسمي كعلامة مائية.';
+  else if (m.media) text = m.media.kind === 'image' ? pick(['صورة حلوة! 📸 وصلتني بدون مشاكل.', 'وصلت الصورة ✅ شفت كيف تتحمّل؟']) : pick(['وصلني الفيديو 🎬 شغّال تمام!', 'فيديو رهيب! 👌 وصل كامل.']);
   else if (has('السلام', 'سلام')) text = 'وعليكم السلام ورحمة الله 🌿';
   else if (has('كيف حالك', 'كيفك', 'شلونك', 'اخبارك', 'أخبارك')) text = 'بخير الحمد لله 😊 وأنت؟';
   else if (has('مرحبا', 'هلا', 'اهلا', 'أهلا', 'hi', 'hello')) text = 'هلا والله! 👋 جرّب ترسل لي صورة.';
@@ -892,24 +1061,32 @@ let saveTimer = null;
 function save() { clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 250); }
 function saveNow() {
   clearTimeout(saveTimer);
-  if (suspended || wiped) return;
+  if (suspended || wiped || !me) return;
   const cutoff = Date.now() / 1000 - 13 * 3600;
   for (const k in state.seen) if (state.seen[k] < cutoff) delete state.seen[k];
-  if (!store.set(K.state, state)) {
+  if (!store.set(stateKey(me.id), state)) {
     for (const c of Object.values(state.contacts)) dropMedia(c.msgs.splice(0, Math.max(0, c.msgs.length - 100)));
-    store.set(K.state, state);
+    store.set(stateKey(me.id), state);
   }
 }
+function loadState() {
+  let s = store.get(stateKey(me.id), null);
+  const legacy = store.get(K.legacyState, null);
+  if (!s && legacy) s = legacy; // نقل بيانات الإصدار السابق
+  if (legacy) store.del(K.legacyState);
+  state = normalizeState(s);
+}
+
 function saveSettings() { store.set(K.settings, settings); applySettings(); syncSettingsUI(); }
 
 // ---------- العرض ----------
 function tick(status) {
   switch (status) {
-    case 'sending': return '<span class="ms tick" title="جارٍ الإرسال">schedule</span>';
-    case 'failed': return '<span class="ms tick failed" title="لم تُرسل">error</span>';
-    case 'sent': return '<span class="ms tick" title="أُرسلت">check</span>';
-    case 'delivered': return '<span class="ms tick" title="وصلت">done_all</span>';
-    case 'read': return '<span class="ms tick read" title="قُرئت">done_all</span>';
+    case 'sending': return '<span data-s="sending" class="ms tick" title="جارٍ الإرسال">schedule</span>';
+    case 'failed': return '<span data-s="failed" class="ms tick failed" title="لم تُرسل">error</span>';
+    case 'sent': return '<span data-s="sent" class="ms tick" title="أُرسلت">check</span>';
+    case 'delivered': return '<span data-s="delivered" class="ms tick" title="وصلت">done_all</span>';
+    case 'read': return '<span data-s="read" class="ms tick read" title="قُرئت">done_all</span>';
     default: return '';
   }
 }
@@ -939,16 +1116,16 @@ function renderList() {
     .filter((c) => !q || displayName(c).toLowerCase().includes(q) || (qid && c.id.includes(qid)))
     .sort((a, b) => b.updated - a.updated);
   if (!list.length) { box.innerHTML = '<div class="list-note">لا توجد نتائج</div>'; return; }
-  box.innerHTML = list.map((c) => {
+  box.innerHTML = list.map((c, i) => {
     const last = c.msgs[c.msgs.length - 1];
     let prev;
     if (typing.get(c.id)) prev = '<span class="ci-prev-t typing-t">يكتب…</span>';
     else if (last) prev = (last.me ? tick(last.status) : '') + previewHtml(last);
     else prev = `<span class="ci-prev-t muted">${c.blocked ? 'محظور' : 'ابدأ المحادثة 👋'}</span>`;
-    return `<button class="chat-item${c.id === activeId ? ' active' : ''}${c.unread ? ' unread' : ''}" data-id="${esc(c.id)}" type="button">
-      ${avatar(displayName(c), c.color)}
+    return `<button class="chat-item${c.id === activeId ? ' active' : ''}${c.unread ? ' unread' : ''}" data-id="${esc(c.id)}" type="button" style="--i:${Math.min(i, 12)}">
+      ${avatar(displayName(c), c.color, '', c.av)}
       <div class="ci-body">
-        <div class="ci-top"><span class="ci-name">${esc(displayName(c))}</span><span class="ci-time">${last ? listTime(last.ts) : ''}</span></div>
+        <div class="ci-top"><span class="ci-name">${nameHtml(displayName(c), c.id)}</span><span class="ci-time">${last ? listTime(last.ts) : ''}</span></div>
         <div class="ci-bottom"><span class="ci-prev">${prev}</span>${c.unread ? `<span class="badge">${c.unread > 99 ? '99+' : c.unread}</span>` : ''}</div>
       </div>
     </button>`;
@@ -964,12 +1141,22 @@ function mediaHtml(m) {
   const md = m.media;
   const st = mediaState(m);
   const ratio = md.w && md.h ? Math.min(Math.max(md.w / md.h, 0.56), 1.9) : md.kind === 'video' ? 16 / 9 : 4 / 3;
+  // الوسائط المحمية تظهر للمستلم فقط أثناء الضغط عليها، مع علامة مائية باسمه
+  const prot = md.pr && !m.me;
   let body = '';
   if (st === 'ready' || st === 'uploading') {
     body = md.kind === 'image'
-      ? `<img class="mb-full" data-src="${esc(m.id)}" alt="صورة">`
-      : `<video class="mb-full" data-src="${esc(m.id)}" controls playsinline preload="metadata"></video>`;
+      ? `<img class="mb-full" data-src="${esc(m.id)}" alt="صورة" draggable="false">`
+      : prot
+        ? `<video class="mb-full" data-src="${esc(m.id)}" playsinline preload="metadata" disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"></video>`
+        : `<video class="mb-full" data-src="${esc(m.id)}" controls playsinline preload="metadata"></video>`;
   }
+  if (prot && st === 'ready') {
+    const wm = esc(`${me.name} · ${formatId(me.id)}`);
+    body += `<div class="mb-wm" aria-hidden="true">${`<span>${wm}</span>`.repeat(14)}</div>
+      <div class="mb-shield"><span class="ms">shield</span><small>اضغط مطولًا للعرض</small></div>`;
+  }
+  const prBadge = md.pr && m.me && st === 'ready' ? '<span class="mb-pr" title="محمية"><span class="ms fill">shield</span></span>' : '';
   let overlay = '';
   if (st === 'uploading' || st === 'downloading') {
     const p = progress.get(m.id);
@@ -980,7 +1167,7 @@ function mediaHtml(m) {
   else if (st === 'requested') overlay = '<div class="mb-state"><span class="ms">hourglass_top</span><small>بانتظار إعادة الإرسال من المرسل…</small></div>';
   const dur = md.kind === 'video' && md.dur && st !== 'ready' ? `<span class="mb-dur"><span class="ms">videocam</span>${fmtDur(md.dur)}</span>` : '';
   const thumb = md.thumb ? `<img class="mb-thumb" src="${esc(md.thumb)}" alt="">` : '';
-  return `<div class="mb" data-st="${st}" style="aspect-ratio:${ratio.toFixed(3)}">${thumb}${body}${overlay}${dur}</div>`;
+  return `<div class="mb${prot ? ' prot' : ''}" data-st="${st}" style="aspect-ratio:${ratio.toFixed(3)}">${thumb}${body}${overlay}${dur}${prBadge}</div>`;
 }
 
 function msgHtml(m, prev, isNew) {
@@ -1026,8 +1213,8 @@ function renderMessages(c) {
   const box = $('#messages');
   if (!c.msgs.length) {
     box.innerHTML = `<div class="conv-empty">
-      ${avatar(displayName(c), c.color, 'av-lg')}
-      <b>${esc(displayName(c))}</b>
+      ${avatar(displayName(c), c.color, 'av-lg', c.av)}
+      <b>${nameHtml(displayName(c), c.id)}</b>
       <bdi${c.bot ? ' class="plain"' : ''}>${esc(idLabel(c))}</bdi>
       <p>${c.bot ? '🤖 هذا حساب تجريبي داخل جهازك فقط. اكتب له أي شيء 👋' : '🔒 الرسائل في هذه المحادثة مشفّرة من طرف إلى طرف. قل مرحبًا 👋'}</p>
     </div>${typing.get(c.id) ? typingRowHtml() : ''}`;
@@ -1063,7 +1250,10 @@ function refreshMsg(c, m) {
   if (m.status === 'failed') el.title = 'لم تُرسل — اضغط لإعادة المحاولة';
   else el.removeAttribute('title');
   const t = $('.tick', el);
-  if (t) t.outerHTML = tick(m.status);
+  if (t && t.dataset.s !== m.status) {
+    t.outerHTML = tick(m.status);
+    $('.tick', el)?.classList.add('pop');
+  }
   if (m.media) refreshMedia(c, m);
 }
 
@@ -1081,8 +1271,8 @@ function refreshMedia(c, m) {
 }
 
 function renderConvHead(c) {
-  $('#convAv').innerHTML = avatar(displayName(c), c.color, 'av-sm');
-  $('#convName').textContent = displayName(c);
+  $('#convAv').innerHTML = avatar(displayName(c), c.color, 'av-sm', c.av);
+  $('#convName').innerHTML = nameHtml(displayName(c), c.id);
   const isTyping = !!typing.get(c.id);
   $('#convSubWrap').classList.toggle('typing', isTyping);
   $('#convSubIcon').textContent = c.bot ? 'smart_toy' : 'lock';
@@ -1117,6 +1307,10 @@ function openChat(id, { push = true } = {}) {
   $('#conv').hidden = false;
   renderConvHead(c);
   renderMessages(c);
+  const conv = $('#conv');
+  conv.classList.remove('enter');
+  void conv.offsetWidth;
+  conv.classList.add('enter');
   input.value = drafts[id] || '';
   autosize();
   markChatRead(c);
@@ -1154,10 +1348,12 @@ function openDrawer(name) {
 }
 function closeDrawers() { $$('.drawer.open').forEach((d) => d.classList.remove('open')); }
 
-function toggleMenu() { $('#convMenu').hidden = !$('#convMenu').hidden; }
-function closeMenu() { $('#convMenu').hidden = true; toggleAttach(false); }
-function toggleAttach(show = $('#attachMenu').hidden) {
-  $('#attachMenu').hidden = !show;
+function toggleMenu() { const m = $('#convMenu'); if (m.hidden || m.classList.contains('closing')) openEl(m); else closeEl(m); }
+function closeMenu() { closeEl($('#convMenu')); toggleAttach(false); }
+function toggleAttach(show) {
+  const m = $('#attachMenu');
+  if (show === undefined) show = m.hidden || m.classList.contains('closing');
+  if (show) openEl(m); else closeEl(m);
   $('#attachBtn').setAttribute('aria-expanded', String(show));
 }
 
@@ -1225,8 +1421,10 @@ async function parseInvite(str) {
 
 function startChatWith(p) {
   let c = state.contacts[p.id];
-  if (!c) c = state.contacts[p.id] = newContact(p);
-  else {
+  if (!c) {
+    c = state.contacts[p.id] = newContact(p);
+    if (p.av) c.av = p.av;
+  } else {
     if (!c.name && p.name) c.name = p.name;
     if (c.blocked) toast('هذا الشخص محظور لديك', 'block');
   }
@@ -1252,8 +1450,8 @@ async function findContact() {
     if (!p) return note('info', 'لم نعثر على هذا المعرّف. قد لا يكون صاحبه فتح مرسال مؤخرًا — اطلب منه رابط الدعوة من الإعدادات.');
   }
   out.innerHTML = `<div class="found">
-    ${avatar(p.name || '؟', p.color)}
-    <div class="found-body"><b>${esc(p.name || 'مستخدم')}</b><bdi>${formatId(p.id)}</bdi></div>
+    ${avatar(p.name || '؟', p.color, '', p.av)}
+    <div class="found-body"><b>${nameHtml(p.name || 'مستخدم', p.id)}</b><bdi>${formatId(p.id)}</bdi></div>
     <button class="btn btn-primary" id="foundGo" type="button">مراسلة</button>
   </div>`;
   $('#foundGo').onclick = () => startChatWith(p);
@@ -1295,7 +1493,10 @@ function syncSettingsUI() {
 }
 
 function renderSettings() {
-  $('#setAv').innerHTML = avatar(me.name, me.color, 'av-xl');
+  $('#setAv').innerHTML = avatar(me.name, me.color, 'av-xl', me.av);
+  $('#removeAvatar').hidden = !me.av;
+  $('#setVerified').hidden = !isVerified(me.id);
+  $('#passwordLabel').textContent = store.get(vaultKey(me.id), null) ? 'تغيير كلمة المرور' : 'إضافة كلمة مرور';
   if (document.activeElement !== $('#setName')) $('#setName').value = me.name;
   renderSwatches($('#setColors'), me.color, (c) => { me.color = c; saveMe(); });
   syncSettingsUI();
@@ -1305,7 +1506,7 @@ function renderSettings() {
 function renderBlocked() {
   const list = Object.values(state.contacts).filter((c) => c.blocked);
   $('#blockedList').innerHTML = list.length
-    ? list.map((c) => `<div class="row">${avatar(displayName(c), c.color, 'av-sm')}<span class="row-text"><b>${esc(displayName(c))}</b><small><bdi>${esc(idLabel(c))}</bdi></small></span><button class="btn btn-soft btn-sm" data-unblock="${esc(c.id)}" type="button">إلغاء الحظر</button></div>`).join('')
+    ? list.map((c) => `<div class="row">${avatar(displayName(c), c.color, 'av-sm', c.av)}<span class="row-text"><b>${nameHtml(displayName(c), c.id)}</b><small><bdi>${esc(idLabel(c))}</bdi></small></span><button class="btn btn-soft btn-sm" data-unblock="${esc(c.id)}" type="button">إلغاء الحظر</button></div>`).join('')
     : '<div class="row"><span class="ms">block</span><span class="row-text"><b>المحظورون</b><small>لا يوجد أحد محظور.</small></span></div>';
 }
 
@@ -1387,13 +1588,14 @@ function openModal(html, setup) {
   return new Promise((resolve) => {
     const m = $('#modal');
     m.innerHTML = html;
-    m.hidden = false;
-    let cleanup = null;
+    openEl(m);
+    let cleanup = null, finished = false;
     const done = (v) => {
-      m.hidden = true;
-      m.innerHTML = '';
+      if (finished) return;
+      finished = true;
       document.removeEventListener('keydown', onKey, true);
-      cleanup?.();
+      const fn = cleanup;
+      closeEl(m, () => { m.innerHTML = ''; fn?.(); });
       resolve(v);
     };
     const onKey = (e) => { if (e.key === 'Escape' && m.dataset.dismiss !== 'no') { e.stopPropagation(); done(null); } };
@@ -1428,15 +1630,18 @@ function previewDialog(prep) {
         <span class="pv-size">${fmtSize(prep.blob.size)}${prep.dur ? ` · ${fmtDur(prep.dur)}` : ''}</span>
       </div>
       <div class="pv-media">${img ? `<img src="${url}" alt="">` : `<video src="${url}" controls playsinline muted></video>`}</div>
+      <div class="pv-opts"><button class="chip${settings.protect ? ' on' : ''}" type="button" data-protect aria-pressed="${settings.protect}"><span class="ms fill">shield</span> محمية من الحفظ</button></div>
       <form class="pv-row">
         <input class="input" id="pvCaption" placeholder="أضف تعليقًا (اختياري)" maxlength="${MAX_CAPTION}" autocomplete="off" />
         <button class="send-btn" type="submit" aria-label="إرسال"><span class="ms fill flip">send</span></button>
       </form>
     </div>`, (m, done) => {
     $('[data-close-pv]', m).onclick = () => done(null);
+    const chip = $('[data-protect]', m);
+    chip.onclick = () => { const on = !chip.classList.contains('on'); chip.classList.toggle('on', on); chip.setAttribute('aria-pressed', String(on)); };
     $('form', m).onsubmit = (e) => {
       e.preventDefault();
-      done(String($('#pvCaption').value || '').trim().slice(0, MAX_CAPTION));
+      done({ caption: String($('#pvCaption').value || '').trim().slice(0, MAX_CAPTION), protect: chip.classList.contains('on') });
     };
     if (!isMobile()) setTimeout(() => $('#pvCaption').focus(), 50);
     return () => URL.revokeObjectURL(url);
@@ -1452,10 +1657,85 @@ function openViewer(src, id) {
       <a class="icon-btn" href="${esc(src)}" download="mersal-${esc(id)}.${esc(ext)}" aria-label="حفظ"><span class="ms">download</span></a>
     </div>
     <img src="${esc(src)}" alt="">`;
-  v.hidden = false;
+  openEl(v);
   v.onclick = (e) => { if (e.target === v || e.target.closest('[data-close-viewer]')) closeViewer(); };
 }
-function closeViewer() { $('#viewer').hidden = true; $('#viewer').innerHTML = ''; }
+function closeViewer() { const v = $('#viewer'); closeEl(v, () => { v.innerHTML = ''; }); }
+
+// ---------- حماية الوسائط ----------
+function revealProtected(mb) {
+  if (!mb || mb.classList.contains('reveal')) return;
+  hideProtected();
+  mb.classList.add('reveal');
+  const v = $('video', mb);
+  if (v) v.play().catch(() => {});
+}
+function hideProtected() {
+  $$('.mb.prot.reveal').forEach((mb) => {
+    mb.classList.remove('reveal');
+    const v = $('video', mb);
+    if (v) v.pause();
+  });
+}
+
+// ---------- كلمة المرور وتسجيل الخروج ----------
+function passwordDialog() {
+  const has = !!store.get(vaultKey(me.id), null);
+  $('#modal').dataset.dismiss = 'yes';
+  return openModal(`<form class="modal-card" role="dialog" aria-modal="true" novalidate>
+      <h3>${has ? 'تغيير كلمة المرور' : 'إضافة كلمة مرور'}</h3>
+      <p>ادخل بها مع معرّفك <bdi class="mono">${formatId(me.id)}</bdi> متى ما أردت. اختر كلمة قوية (8 أحرف على الأقل) ولا تنسها.</p>
+      <input type="text" autocomplete="username" value="${formatId(me.id)}" hidden />
+      <label class="field"><span>كلمة المرور</span><input class="input" id="pw1" type="password" dir="ltr" autocomplete="new-password" /></label>
+      <label class="field"><span>تأكيد كلمة المرور</span><input class="input" id="pw2" type="password" dir="ltr" autocomplete="new-password" /></label>
+      <div class="modal-actions">
+        <button class="btn btn-soft" data-r="0" type="button">إلغاء</button>
+        <button class="btn btn-primary" type="submit">حفظ</button>
+      </div>
+    </form>`, (m, done) => {
+    $('[data-r="0"]', m).onclick = () => done(false);
+    $('form', m).onsubmit = async (e) => {
+      e.preventDefault();
+      const a = $('#pw1', m).value, b = $('#pw2', m).value;
+      if (a.length < 8) { shake($('#pw1', m)); return toast('كلمة المرور قصيرة — 8 أحرف على الأقل.', 'error'); }
+      if (a !== b) { shake($('#pw2', m)); return toast('كلمتا المرور غير متطابقتين.', 'error'); }
+      const btn = $('[type="submit"]', m);
+      busy(btn, true);
+      try {
+        store.set(vaultKey(me.id), await makeVault(a));
+        publishVault(true);
+        done(true);
+        renderSettings();
+        toast('تم حفظ كلمة المرور');
+      } catch {
+        busy(btn, false);
+        toast('تعذّر حفظ كلمة المرور.', 'error');
+      }
+    };
+    setTimeout(() => $('#pw1', m).focus(), 80);
+  });
+}
+
+async function signOut() {
+  if (!store.get(vaultKey(me.id), null)) {
+    const ok = await confirmDialog({ title: 'أضف كلمة مرور أولًا', text: 'حتى تستطيع الدخول مجددًا بمعرّفك، أضف كلمة مرور قبل تسجيل الخروج.', ok: 'إضافة كلمة مرور' });
+    if (ok) passwordDialog();
+    return;
+  }
+  const ok = await confirmDialog({
+    title: 'تسجيل الخروج؟',
+    text: `للدخول مجددًا استخدم معرّفك ${formatId(me.id)} وكلمة المرور. تبقى محادثاتك محفوظة على هذا الجهاز.`,
+    ok: 'تسجيل الخروج',
+  });
+  if (!ok) return;
+  await publishVault(true);
+  store.set(profKey(me.id), { av: me.av || '', ah: me.ah || '' });
+  saveNow();
+  wiped = true;
+  es?.close();
+  store.del(K.id);
+  location.replace(location.pathname);
+}
 
 function shake(el) {
   el.classList.remove('shake');
@@ -1490,12 +1770,27 @@ function suspend() {
 let obColor = AV_COLORS[Math.floor(Math.random() * AV_COLORS.length)];
 function obStep(name) { $$('.ob-step').forEach((s) => { s.hidden = s.dataset.step !== name; }); }
 
+let obAvatar = '';
+function renderObAvatar() {
+  $('#obAv').innerHTML = avatar(cleanName($('#obName').value) || '؟', obColor, 'av-xl', obAvatar);
+}
+
 function showOnboard() {
   $('#app').hidden = true;
   $('#onboard').hidden = false;
-  obStep('welcome');
-  renderSwatches($('#obColors'), obColor, (c) => { obColor = c; });
-  if (!isMobile()) setTimeout(() => $('#obName').focus(), 100);
+  renderSwatches($('#obColors'), obColor, (c) => { obColor = c; renderObAvatar(); });
+  renderObAvatar();
+  // من سجّل خروجه سابقًا يرى شاشة الدخول مباشرة
+  const last = store.get(K.lastId, null);
+  if (last && store.get(vaultKey(last), null)) {
+    obStep('login');
+    $('#obLoginId').value = formatId(last);
+    $('#obLoginTitle').textContent = 'مرحبًا مجددًا 👋';
+    if (!isMobile()) setTimeout(() => $('#obLoginPw').focus(), 100);
+  } else {
+    obStep('welcome');
+    if (!isMobile()) setTimeout(() => $('#obName').focus(), 100);
+  }
 }
 
 async function startApp() {
@@ -1509,13 +1804,18 @@ async function startApp() {
   }
   $('#onboard').hidden = true;
   $('#app').hidden = false;
+  store.set(K.lastId, me.id);
+  loadState();
   channel?.postMessage({ t: 'takeover' });
   ensureDemo();
+  $('#chatList').classList.add('intro');
+  setTimeout(() => $('#chatList').classList.remove('intro'), 1000);
   renderMe();
   renderList();
   updateTitle();
   subscribe();
   publishProfile();
+  publishVault();
   handleHash();
   // استكمال تنزيل المرفقات التي انقطع تنزيلها
   for (const c of Object.values(state.contacts)) {
@@ -1537,6 +1837,7 @@ function bindUI() {
     busy(btn, true);
     try {
       me = await createIdentity(name, obColor);
+      if (obAvatar) { me.av = obAvatar; me.ah = await avatarHash(obAvatar); }
       store.set(K.id, me);
       renderMe();
       obStep('done');
@@ -1548,7 +1849,43 @@ function bindUI() {
   };
   $('#obEnter').onclick = startApp;
   $('#obRestoreOpen').onclick = () => { obStep('restore'); setTimeout(() => $('#obKey').focus(), 50); };
-  $('#obRestoreBack').onclick = () => obStep('welcome');
+  $$('[data-ob]').forEach((b) => { b.onclick = () => obStep(b.dataset.ob); });
+  $('#obName').addEventListener('input', renderObAvatar);
+  $('#obAvatarInput').onchange = async () => {
+    const f = $('#obAvatarInput').files[0];
+    $('#obAvatarInput').value = '';
+    if (!f) return;
+    try { obAvatar = await makeAvatar(f); renderObAvatar(); } catch (err) { toast(ERR[err.message] || ERR.decode, 'error'); }
+  };
+  $('#obLoginForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const id = normalizeId($('#obLoginId').value);
+    const pw = $('#obLoginPw').value;
+    if (!validId(id)) { shake($('#obLoginId')); return toast('المعرّف غير صحيح.', 'error'); }
+    if (!pw) return shake($('#obLoginPw'));
+    const btn = $('#obLoginGo');
+    busy(btn, true);
+    try {
+      const { ident, vault } = await login(id, pw);
+      me = ident;
+      const prof = store.get(profKey(id), null) || (await lookupProfile(id).catch(() => null));
+      if (prof?.av && validAvatar(prof.av)) { me.av = prof.av; me.ah = await avatarHash(prof.av); }
+      store.set(vaultKey(id), vault);
+      store.set(K.id, me);
+      $('#obLoginPw').value = '';
+      startApp();
+    } catch (err) {
+      const msg = {
+        password: 'كلمة المرور غير صحيحة.',
+        missing: 'لم نجد هذا الحساب. إن لم يُفتح منذ أكثر من 12 ساعة على أي جهاز، استخدم المفتاح الاحتياطي.',
+        network: ERR.network,
+      }[err.message] || 'تعذّر تسجيل الدخول.';
+      toast(msg, 'error', 4500);
+      if (err.message === 'password') shake($('#obLoginPw'));
+    } finally {
+      busy(btn, false);
+    }
+  };
   $('#obRestoreGo').onclick = async () => {
     try {
       me = await parseBackup($('#obKey').value);
@@ -1583,7 +1920,7 @@ function bindUI() {
     const m = c.msgs.find((x) => x.id === row.dataset.id);
     if (!m) return;
     const img = e.target.closest('img.mb-full.loaded');
-    if (img) return openViewer(img.src, m.id);
+    if (img && !img.closest('.mb.prot')) return openViewer(img.src, m.id);
     if (e.target.closest('[data-media-retry]')) return downloadMedia(c, m);
     if (e.target.closest('[data-media-req]')) return requestResend(c, m);
     if (row.classList.contains('failed') && !e.target.closest('a, video')) retry(m.id);
@@ -1632,7 +1969,9 @@ function bindUI() {
       const b = e.target.closest('button');
       if (!b) return;
       settings[s.dataset.setting] = b.dataset.v;
-      saveSettings();
+      // انتقال ناعم عند تغيير الثيم
+      if (s.dataset.setting === 'theme' && document.startViewTransition && !reduceMotion()) document.startViewTransition(saveSettings);
+      else saveSettings();
     };
   });
   $$('.switch[data-setting]').forEach((x) => {
@@ -1656,6 +1995,21 @@ function bindUI() {
     toast('تم حفظ الاسم');
   };
   $('#setName').onkeydown = (e) => { if (e.key === 'Enter') e.target.blur(); };
+  $('#avatarInput').onchange = async () => {
+    const f = $('#avatarInput').files[0];
+    $('#avatarInput').value = '';
+    if (!f) return;
+    try {
+      me.av = await makeAvatar(f);
+      me.ah = await avatarHash(me.av);
+      saveMe();
+      pushAvatar();
+      toast('تم تحديث صورتك');
+    } catch (err) { toast(ERR[err.message] || ERR.decode, 'error'); }
+  };
+  $('#removeAvatar').onclick = () => { me.av = ''; me.ah = ''; saveMe(); pushAvatar(); toast('تمت إزالة الصورة'); };
+  $('#passwordBtn').onclick = () => passwordDialog();
+  $('#signoutBtn').onclick = () => signOut();
   $('#blockedList').onclick = (e) => { const b = e.target.closest('[data-unblock]'); if (b) toggleBlock(b.dataset.unblock); };
   $('#exportKey').onclick = async () => {
     const ok = await confirmDialog({
@@ -1675,14 +2029,14 @@ function bindUI() {
     if (!ok) return;
     wiped = true;
     es?.close();
-    Object.values(K).forEach((k) => store.del(k));
+    [K.id, K.legacyState, K.lastId, stateKey(me.id), vaultKey(me.id), profKey(me.id)].forEach((k) => store.del(k));
     try { indexedDB.deleteDatabase('mrsl'); } catch {}
     location.replace(location.pathname);
   };
 
   // عام
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('#convMenu')) $('#convMenu').hidden = true;
+    if (!e.target.closest('#convMenu')) closeEl($('#convMenu'));
     if (!e.target.closest('#attachMenu, #attachBtn')) toggleAttach(false);
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (act === 'copy-id' && me) copy(formatId(me.id), 'تم نسخ معرّفك');
@@ -1709,6 +2063,21 @@ function bindUI() {
     if (c) { markChatRead(c); renderList(); updateTitle(); }
   });
   window.addEventListener('online', subscribe);
+  // حماية الوسائط: تظهر أثناء الضغط فقط، وتختفي فورًا عند مغادرة الصفحة أو محاولة التصوير
+  const msgs = $('#messages');
+  msgs.addEventListener('pointerdown', (e) => { const mb = e.target.closest('.mb.prot'); if (mb) revealProtected(mb); });
+  ['pointerup', 'pointercancel'].forEach((ev) => document.addEventListener(ev, hideProtected));
+  msgs.addEventListener('pointerleave', hideProtected);
+  msgs.addEventListener('contextmenu', (e) => { if (e.target.closest('.mb.prot')) e.preventDefault(); });
+  window.addEventListener('blur', hideProtected);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) hideProtected(); });
+  document.addEventListener('keydown', (e) => {
+    const shot = e.key === 'PrintScreen' || (e.metaKey && e.shiftKey && ['3', '4', '5', 's', 'S'].includes(e.key));
+    if (shot) {
+      hideProtected();
+      if ($('.mb.prot')) toast('تم إخفاء الوسائط المحمية', 'shield');
+    }
+  }, true);
   window.addEventListener('pagehide', saveNow);
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applySettings);
 }
