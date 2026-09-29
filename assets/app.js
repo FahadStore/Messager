@@ -1155,7 +1155,11 @@ function openDrawer(name) {
 function closeDrawers() { $$('.drawer.open').forEach((d) => d.classList.remove('open')); }
 
 function toggleMenu() { $('#convMenu').hidden = !$('#convMenu').hidden; }
-function closeMenu() { $('#convMenu').hidden = true; }
+function closeMenu() { $('#convMenu').hidden = true; toggleAttach(false); }
+function toggleAttach(show = $('#attachMenu').hidden) {
+  $('#attachMenu').hidden = !show;
+  $('#attachBtn').setAttribute('aria-expanded', String(show));
+}
 
 function openDemo() {
   const c = ensureDemo(true);
@@ -1598,12 +1602,17 @@ function bindUI() {
   $('#composer').onsubmit = (e) => { e.preventDefault(); sendCurrent(); input.focus(); };
 
   // الصور والفيديو
-  $('#attachBtn').onclick = () => $('#fileInput').click();
-  $('#fileInput').onchange = () => {
-    const f = $('#fileInput').files[0];
-    $('#fileInput').value = '';
-    if (f) pickFile(f);
-  };
+  // المتصفحات داخل التطبيقات (تيليجرام، إنستغرام…) قد لا تسمح برفع الملفات
+  $('#attachHint').hidden = !/Telegram|Instagram|FBAN|FBAV|FB_IAB|Snapchat|musical_ly|BytedanceWebview|Line\/|MicroMessenger|; wv\)/i.test(navigator.userAgent);
+  $('#attachBtn').onclick = (e) => { e.stopPropagation(); toggleAttach(); };
+  $('#attachMenu').onclick = (e) => { if (e.target.closest('label')) setTimeout(() => toggleAttach(false), 60); };
+  for (const id of ['#fileInput', '#cameraInput']) {
+    $(id).onchange = () => {
+      const f = $(id).files[0];
+      $(id).value = '';
+      if (f) pickFile(f);
+    };
+  }
   const conv = $('#conv');
   const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
   conv.addEventListener('dragover', (e) => { if (hasFiles(e)) { e.preventDefault(); conv.classList.add('dragging'); } });
@@ -1673,7 +1682,8 @@ function bindUI() {
 
   // عام
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('#convMenu')) closeMenu();
+    if (!e.target.closest('#convMenu')) $('#convMenu').hidden = true;
+    if (!e.target.closest('#attachMenu, #attachBtn')) toggleAttach(false);
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (act === 'copy-id' && me) copy(formatId(me.id), 'تم نسخ معرّفك');
     if (act === 'share' && me) shareInvite();
@@ -1683,7 +1693,7 @@ function bindUI() {
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || !$('#modal').hidden) return;
     if (!$('#viewer').hidden) return closeViewer();
-    if (!$('#convMenu').hidden) return closeMenu();
+    if (!$('#convMenu').hidden || !$('#attachMenu').hidden) return closeMenu();
     if ($('.drawer.open')) return closeDrawers();
     if (activeId) $('#backBtn').click();
   });

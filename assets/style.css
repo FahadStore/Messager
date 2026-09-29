@@ -608,7 +608,7 @@ label.row, .row-btn { cursor: pointer; }
   font-size: .84rem; color: var(--text-2);
 }
 
-.composer-wrap { padding: 8px clamp(10px, 3vw, 48px); padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+.composer-wrap { position: relative; padding: 8px clamp(10px, 3vw, 48px); padding-bottom: max(10px, env(safe-area-inset-bottom)); }
 .composer {
   display: flex; align-items: flex-end; gap: 8px;
   padding: 6px;
@@ -660,6 +660,39 @@ label.row, .row-btn { cursor: pointer; }
 }
 .attach-btn:hover { background: var(--bg-3); color: var(--text); }
 .attach-btn:active { transform: scale(.92); }
+
+/* قائمة الإرفاق */
+.file-hidden {
+  position: absolute; width: 1px; height: 1px;
+  opacity: 0; overflow: hidden;
+  clip-path: inset(50%);
+  pointer-events: none;
+}
+.attach-menu {
+  position: absolute; bottom: calc(100% - 2px); inset-inline-start: clamp(10px, 3vw, 48px); z-index: 20;
+  min-width: 220px; max-width: calc(100% - 20px);
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line); border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+  transform-origin: bottom right;
+  animation: attachIn .2s var(--ease);
+}
+.am-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  cursor: pointer; user-select: none;
+  font-size: .95rem;
+  transition: background-color .15s var(--ease);
+}
+.am-item:hover, .am-item:active { background: var(--bg-2); }
+.am-ic { width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; background: var(--bg-3); }
+.am-ic .ms { font-size: 21px; }
+.am-hint { display: flex; gap: 6px; margin: 6px 8px 4px; max-width: 250px; font-size: .78rem; line-height: 1.5; color: var(--text-3); }
+.am-hint .ms { font-size: 16px; margin-top: 2px; }
+@media (pointer: fine) { .am-item.camera { display: none; } }
+@keyframes attachIn { from { opacity: 0; transform: translateY(6px) scale(.97); } }
 
 /* ===== الصور والفيديو ===== */
 .bubble.media { width: min(300px, 72vw); max-width: none; padding: 3px; }
