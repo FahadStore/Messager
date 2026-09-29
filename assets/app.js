@@ -12,9 +12,15 @@ const MAX_TEXT = 1000;
 const MAX_CAPTION = 300;
 const MAX_BODY = 4000; // ntfy يحوّل الرسائل الأكبر من 4096 بايت إلى مرفقات
 const MAX_MSGS = 400;
-const MAX_MEDIA = 14.5 * 1024 * 1024; // حد مرفقات ntfy.sh هو 15 ميغابايت
+// ntfy.sh يقبل مرفقات حتى 2 ميغابايت فقط، ومجموع 20 ميغابايت لكل مستخدم كل 3 ساعات،
+// لذلك يُقسَّم الملف المشفّر إلى أجزاء أصغر من 2 ميغابايت ويُعاد تجميعها عند المستلم.
+const CHUNK = 1900 * 1024;
+const MAX_CHUNKS = 9;
+const MAX_MEDIA = 15 * 1024 * 1024;
 const MAX_IMAGE_INPUT = 60 * 1024 * 1024; // الصور الكبيرة تُضغط قبل الإرسال
 const IMG_MAX_SIDE = 1920;
+const IMG_TARGET = 1.5 * 1024 * 1024;
+const CHUNK_TIMEOUT = 120e3;
 const MEDIA_TTL = 2.5 * 3600e3; // ntfy.sh يحذف المرفقات بعد 3 ساعات
 const RESEND_AFTER = 11 * 3600e3; // ntfy.sh يحتفظ بالرسائل 12 ساعة
 const RESEND_MAX_AGE = 7 * 864e5;
@@ -36,7 +42,9 @@ const DEFAULTS = {
 const RANK = { failed: 0, sending: 0, sent: 1, delivered: 2, read: 3 };
 const ERR = {
   too_long: 'الرسالة طويلة جدًا.',
-  too_big: 'الملف كبير جدًا — الحد الأقصى 14 ميغابايت.',
+  too_big: 'الملف كبير جدًا — الحد الأقصى 15 ميغابايت.',
+  quota: 'وصلت حد الرفع المؤقت (20 ميغابايت كل 3 ساعات). حاول لاحقًا.',
+  timeout: 'انقطع الرفع لبطء الاتصال. اضغط على الرسالة لإعادة المحاولة.',
   type: 'يمكن إرسال الصور والفيديوهات فقط.',
   decode: 'تعذّرت قراءة الملف. جرّب صورة JPG أو PNG أو فيديو MP4.',
   rate: 'أرسلت كثيرًا بسرعة، انتظر قليلًا ثم حاول.',
@@ -65,16 +73,15 @@ const idb = (() => {
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
   }));
-  const run = async (mode, fn) => {
-    const db = await open();
-    return new Promise((resolve, reject) => {
+  // مهلة حتى لا يعلق التطبيق إن تعطّل IndexedDB (يحدث في بعض المتصفحات المدمجة)
+  const withTimeout = (p) => Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error('idb-timeout')), 5000))]);
+  const run = (mode, fn) => withTimeout(open().then((db) => new Promise((resolve, reject) => {
       const t = db.transaction('media', mode);
       const req = fn(t.objectStore('media'));
       t.oncomplete = () => resolve(req.result);
       t.onerror = () => reject(t.error);
       t.onabort = () => reject(t.error);
-    });
-  };
+    })));
   return {
     get: (k) => run('readonly', (s) => s.get(k)),
     put: (k, v) => run('readwrite', (s) => s.put(v, k)),
@@ -94,6 +101,8 @@ const drafts = {};
 const keyCache = new Map();
 const pendingReceipts = new Map();
 const blobUrls = new Map();
+const memBlobs = new Map(); // نسخة في الذاكرة للجلسة الحالية حتى لو تعذّر الحفظ في IndexedDB
+const progress = new Map();
 const downloading = new Set();
 const typing = new Map();
 
@@ -103,7 +112,10 @@ function normalizeState(s) {
   s.seen ||= {};
   for (const c of Object.values(s.contacts)) {
     c.msgs ||= [];
-    for (const m of c.msgs) if (m.me && m.status === 'sending') m.status = 'failed';
+    for (const m of c.msgs) {
+      if (m.me && m.status === 'sending') m.status = 'failed';
+      if (m.media?.u && !m.media.us) { m.media.us = [m.media.u]; delete m.media.u; }
+    }
   }
   return s;
 }
@@ -266,46 +278,108 @@ async function lookupProfile(id) {
   return null;
 }
 
-// رفع ملف مشفّر كمرفق ntfy على موضوع عشوائي مؤقت
+async function getBlob(id) {
+  if (memBlobs.has(id)) return memBlobs.get(id);
+  const blob = await idb.get(id).catch(() => null);
+  if (blob) memBlobs.set(id, blob);
+  return blob || null;
+}
+
+function putBlob(id, blob) {
+  memBlobs.set(id, blob);
+  return idb.put(id, blob).catch(() => {});
+}
+
+function setProgress(id, frac) {
+  progress.set(id, frac);
+  const el = $(`#messages .msg[data-id="${CSS.escape(id)}"] .pct`);
+  if (el) el.textContent = `${Math.round(frac * 100)}%`;
+}
+
+async function fetchWithTimeout(url, opts = {}) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), CHUNK_TIMEOUT);
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal });
+  } catch (err) {
+    throw new Error(err.name === 'AbortError' ? 'timeout' : 'network');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// رفع ملف مشفّر كأجزاء (مرفقات ntfy) على مواضيع عشوائية مؤقتة
 async function uploadMedia(m) {
-  const blob = await idb.get(m.id).catch(() => null);
+  const blob = await getBlob(m.id);
   if (!blob) throw new Error('missing');
   const key = crypto.getRandomValues(new Uint8Array(32));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ck = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt']);
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, ck, await blob.arrayBuffer());
-  let res;
-  try {
-    res = await fetch(`${NTFY}/${NS}-f-${rid()}?filename=m.bin`, { method: 'POST', body: new Blob([ct]) });
-  } catch { throw new Error('network'); }
-  if (res.status === 413) throw new Error('too_big');
-  if (res.status === 429) throw new Error('rate');
-  if (!res.ok) throw new Error('network');
-  const url = (await res.json().catch(() => null))?.attachment?.url;
-  if (typeof url !== 'string' || !url.startsWith(`${NTFY}/file/`)) throw new Error('network');
-  Object.assign(m.media, { u: url, key: b64e(key), iv: b64e(iv), upAt: Date.now() });
+  const parts = [];
+  for (let i = 0; i < ct.byteLength; i += CHUNK) parts.push(ct.slice(i, i + CHUNK));
+  if (parts.length > MAX_CHUNKS) throw new Error('too_big');
+  const urls = new Array(parts.length);
+  let done = 0;
+  setProgress(m.id, 0.02);
+  const uploadPart = async (i) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await fetchWithTimeout(`${NTFY}/${NS}-f-${rid()}?filename=m.bin`, { method: 'POST', body: new Blob([parts[i]]) });
+        if (res.status === 413) throw new Error('quota');
+        if (res.status === 429) throw new Error('rate');
+        if (!res.ok) throw new Error('network');
+        const url = (await res.json().catch(() => null))?.attachment?.url;
+        if (typeof url !== 'string' || !url.startsWith(`${NTFY}/file/`)) throw new Error('network');
+        urls[i] = url;
+        setProgress(m.id, 0.02 + 0.98 * (++done / parts.length));
+        return;
+      } catch (err) {
+        if (attempt >= 1 || err.message === 'quota' || err.message === 'rate') throw err;
+      }
+    }
+  };
+  // جزءان في نفس الوقت
+  let next = 0;
+  const worker = async () => { while (next < parts.length) await uploadPart(next++); };
+  await Promise.all([worker(), worker()]);
+  Object.assign(m.media, { us: urls, key: b64e(key), iv: b64e(iv), upAt: Date.now() });
+  delete m.media.u;
 }
 
 async function downloadMedia(c, m) {
   if (!m.media || downloading.has(m.id)) return;
   downloading.add(m.id);
   m.media.st = 'downloading';
+  progress.set(m.id, 0);
   refreshMedia(c, m);
   try {
-    const res = await fetch(m.media.u);
-    if (res.status === 404 || res.status === 410) {
+    const urls = m.media.us || [];
+    const bufs = [];
+    let expired = false;
+    for (let i = 0; i < urls.length; i++) {
+      const res = await fetchWithTimeout(urls[i]);
+      if (res.status === 404 || res.status === 410) { expired = true; break; }
+      if (!res.ok) throw new Error('network');
+      bufs.push(new Uint8Array(await res.arrayBuffer()));
+      setProgress(m.id, (i + 1) / urls.length);
+    }
+    if (expired) {
       m.media.st = 'expired';
     } else {
-      if (!res.ok) throw new Error('network');
+      const all = new Uint8Array(bufs.reduce((n, b) => n + b.length, 0));
+      let off = 0;
+      for (const b of bufs) { all.set(b, off); off += b.length; }
       const ck = await crypto.subtle.importKey('raw', b64d(m.media.key), 'AES-GCM', false, ['decrypt']);
-      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(m.media.iv) }, ck, await res.arrayBuffer());
-      await idb.put(m.id, new Blob([pt], { type: m.media.mime }));
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(m.media.iv) }, ck, all);
+      await putBlob(m.id, new Blob([pt], { type: m.media.mime }));
       m.media.st = 'ready';
     }
   } catch {
     m.media.st = 'error';
   } finally {
     downloading.delete(m.id);
+    progress.delete(m.id);
     save();
     refreshMedia(c, m);
   }
@@ -373,7 +447,9 @@ async function handleEvent(raw) {
 function parseMediaWire(a) {
   if (!a || typeof a !== 'object') return null;
   const kind = a.k === 'image' || a.k === 'video' ? a.k : null;
-  if (!kind || typeof a.u !== 'string' || !a.u.startsWith(`${NTFY}/file/`) || typeof a.key !== 'string' || typeof a.iv !== 'string') return null;
+  const us = Array.isArray(a.us) ? a.us : typeof a.u === 'string' ? [a.u] : [];
+  if (!kind || !us.length || us.length > MAX_CHUNKS || !us.every((u) => typeof u === 'string' && u.startsWith(`${NTFY}/file/`) && u.length < 200)) return null;
+  if (typeof a.key !== 'string' || typeof a.iv !== 'string') return null;
   const mime = MIMES.includes(a.m) && a.m.startsWith(kind) ? a.m : kind === 'image' ? 'image/jpeg' : 'video/mp4';
   const thumb = typeof a.t === 'string' && a.t.startsWith('data:image/jpeg;base64,') && a.t.length < 3000 ? a.t : '';
   return {
@@ -381,7 +457,7 @@ function parseMediaWire(a) {
     w: clampInt(a.w), h: clampInt(a.h),
     dur: Number(a.d) > 0 ? Math.min(Number(a.d), 36000) : 0,
     size: clampInt(a.z, MAX_MEDIA * 2),
-    u: a.u, key: a.key, iv: a.iv, st: 'downloading',
+    us, key: a.key, iv: a.iv, st: 'downloading',
   };
 }
 
@@ -512,6 +588,7 @@ function dropMedia(msgs) {
   for (const m of msgs) {
     if (!m.media) continue;
     idb.del(m.id);
+    memBlobs.delete(m.id);
     if (blobUrls.has(m.id)) { URL.revokeObjectURL(blobUrls.get(m.id)); blobUrls.delete(m.id); }
   }
 }
@@ -538,7 +615,7 @@ async function sendMedia(c, prep, caption) {
     id: rid(), me: true, text: caption, ts: Date.now(), status: 'sending',
     media: { kind: prep.kind, mime: prep.mime, w: prep.w, h: prep.h, thumb: prep.thumb, dur: prep.dur, size: prep.blob.size },
   };
-  try { await idb.put(m.id, prep.blob); } catch { return toast('لا توجد مساحة كافية على الجهاز.', 'error'); }
+  putBlob(m.id, prep.blob);
   insertMsg(c, m);
   save();
   appendMessage(c, m);
@@ -552,9 +629,9 @@ async function deliver(c, m, { quiet = false, reupload = false } = {}) {
   try {
     const inner = { t: 'm', id: m.id, x: m.text, s: m.ts, n: me.name, c: me.color };
     if (m.media) {
-      if (reupload || !m.media.u || Date.now() - (m.media.upAt || 0) > MEDIA_TTL) await uploadMedia(m);
+      if (reupload || !m.media.us || Date.now() - (m.media.upAt || 0) > MEDIA_TTL) await uploadMedia(m);
       const md = m.media;
-      inner.a = { k: md.kind, m: md.mime, w: md.w, h: md.h, t: md.thumb, d: md.dur, z: md.size, u: md.u, key: md.key, iv: md.iv };
+      inner.a = { k: md.kind, m: md.mime, w: md.w, h: md.h, t: md.thumb, d: md.dur, z: md.size, us: md.us, key: md.key, iv: md.iv };
     }
     try {
       await sendEnvelope(c, inner);
@@ -571,6 +648,7 @@ async function deliver(c, m, { quiet = false, reupload = false } = {}) {
       toast(ERR[err.message] || ERR.network, 'error');
     }
   }
+  progress.delete(m.id);
   save();
   refreshMsg(c, m);
   renderList();
@@ -644,14 +722,22 @@ async function prepareMedia(file) {
       if (file.size > MAX_IMAGE_INPUT) throw new Error('too_big');
       const img = await loadImage(url).catch(() => { throw new Error('decode'); });
       const w = img.naturalWidth, h = img.naturalHeight;
-      let blob = file, mime = file.type;
+      let blob = file, mime = file.type, side = Math.max(w, h);
       const keepGif = file.type === 'image/gif' && file.size <= MAX_MEDIA;
-      if (!keepGif && (!MIMES.includes(file.type) || Math.max(w, h) > IMG_MAX_SIDE || file.size > 1.5 * 1024 * 1024)) {
-        blob = await toBlob(drawTo(img, w, h, IMG_MAX_SIDE));
+      if (!keepGif && (!MIMES.includes(file.type) || side > IMG_MAX_SIDE || file.size > IMG_TARGET)) {
+        // نضغط حتى يصبح الحجم مناسبًا (أقل من 1.5 ميغابايت غالبًا)
+        let maxSide = Math.min(side, IMG_MAX_SIDE), q = 0.85;
+        blob = await toBlob(drawTo(img, w, h, maxSide), q);
+        while (blob.size > IMG_TARGET && maxSide > 640) {
+          maxSide = Math.round(maxSide * 0.8);
+          q = Math.max(0.6, q - 0.08);
+          blob = await toBlob(drawTo(img, w, h, maxSide), q);
+        }
         mime = 'image/jpeg';
+        side = maxSide;
       }
       if (blob.size > MAX_MEDIA) throw new Error('too_big');
-      const scale = Math.min(1, IMG_MAX_SIDE / Math.max(w, h));
+      const scale = Math.min(1, side / Math.max(w, h));
       return { kind, mime, blob, w: Math.round(w * scale), h: Math.round(h * scale), thumb: makeThumb(img, w, h), dur: 0 };
     }
     if (file.size > MAX_MEDIA) throw new Error('too_big');
@@ -661,12 +747,12 @@ async function prepareMedia(file) {
     v.preload = 'auto';
     v.src = url;
     const wait = (ev, ms) => new Promise((resolve) => { v.addEventListener(ev, resolve, { once: true }); v.addEventListener('error', resolve, { once: true }); setTimeout(resolve, ms); });
-    await wait('loadeddata', 5000);
+    await wait('loadedmetadata', 3000);
     let thumb = '';
     const w = v.videoWidth, h = v.videoHeight, dur = Number.isFinite(v.duration) ? v.duration : 0;
     if (w && h) {
       v.currentTime = Math.min(0.5, dur / 2 || 0);
-      await wait('seeked', 2000);
+      await wait('seeked', 1500);
       try { thumb = makeThumb(v, w, h); } catch {}
     }
     return { kind, mime: MIMES.includes(file.type) ? file.type : 'video/mp4', blob: file, w, h, thumb, dur };
@@ -679,7 +765,9 @@ async function pickFile(file) {
   const c = state.contacts[activeId];
   if (!c || c.blocked || !file) return;
   let prep;
+  toast('جارٍ تجهيز الملف…', 'hourglass_top', 20000);
   try { prep = await prepareMedia(file); } catch (err) { return toast(ERR[err.message] || ERR.decode, 'error'); }
+  hideToast();
   const caption = await previewDialog(prep);
   if (caption !== null) sendMedia(c, prep, caption);
 }
@@ -726,7 +814,7 @@ function botHandle(c, m) {
     if (reply.image) {
       try {
         const img = await botImage();
-        await idb.put(r.id, img.blob);
+        putBlob(r.id, img.blob);
         r.media = { kind: 'image', mime: 'image/jpeg', w: img.w, h: img.h, thumb: img.thumb, dur: 0, size: img.blob.size, st: 'ready' };
       } catch {}
     }
@@ -883,7 +971,10 @@ function mediaHtml(m) {
       : `<video class="mb-full" data-src="${esc(m.id)}" controls playsinline preload="metadata"></video>`;
   }
   let overlay = '';
-  if (st === 'uploading' || st === 'downloading') overlay = '<div class="mb-state"><span class="spinner lg"></span></div>';
+  if (st === 'uploading' || st === 'downloading') {
+    const p = progress.get(m.id);
+    overlay = `<div class="mb-state"><span class="spinner lg"></span><small class="pct">${p ? `${Math.round(p * 100)}%` : ''}</small></div>`;
+  }
   else if (st === 'error') overlay = '<button class="mb-state" data-media-retry type="button"><span class="ms">refresh</span><small>تعذّر التحميل — اضغط للمحاولة</small></button>';
   else if (st === 'expired') overlay = '<button class="mb-state" data-media-req type="button"><span class="ms">history</span><small>انتهت صلاحية الملف — اضغط لطلبه من جديد</small></button>';
   else if (st === 'requested') overlay = '<div class="mb-state"><span class="ms">hourglass_top</span><small>بانتظار إعادة الإرسال من المرسل…</small></div>';
@@ -912,7 +1003,7 @@ function hydrate(root) {
     const id = el.dataset.src;
     let url = blobUrls.get(id);
     if (!url) {
-      const blob = await idb.get(id).catch(() => null);
+      const blob = await getBlob(id);
       if (!blob) return;
       url = blobUrls.get(id) || URL.createObjectURL(blob);
       blobUrls.set(id, url);
@@ -1263,12 +1354,13 @@ function alertIncoming(c, m) {
 }
 
 let toastTimer = null;
-function toast(text, icon = 'check') {
+function hideToast() { clearTimeout(toastTimer); $('#toast').classList.remove('show'); }
+function toast(text, icon = 'check', ms = 2600) {
   const t = $('#toast');
   t.innerHTML = `<span class="ms">${icon}</span><span>${esc(text)}</span>`;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+  toastTimer = setTimeout(() => t.classList.remove('show'), ms);
 }
 
 async function copy(text, msg = 'تم النسخ') {
