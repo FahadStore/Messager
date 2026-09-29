@@ -4,17 +4,25 @@
 // كل مستخدم يملك زوج مفاتيح ECDH (P-256) يُنشأ في متصفحه، ومعرّفه هو بصمة مفتاحه العام.
 // كل رسالة تُشفَّر بمفتاح مشترك (ECDH + HKDF + AES-GCM) لا يعرفه إلا الطرفان،
 // فلا يرى ntfy.sh ولا أي أحد آخر سوى نص مشفّر.
+// الصور والفيديوهات تُشفَّر بمفتاح عشوائي قبل رفعها كمرفق، والمفتاح يُرسل داخل الرسالة المشفّرة.
 
 const NTFY = 'https://ntfy.sh';
 const NS = 'mrsl-v1';
 const MAX_TEXT = 1000;
+const MAX_CAPTION = 300;
 const MAX_BODY = 4000; // ntfy يحوّل الرسائل الأكبر من 4096 بايت إلى مرفقات
 const MAX_MSGS = 400;
-const RESEND_AFTER = 11 * 3600e3; // ntfy يحتفظ بالرسائل 12 ساعة
+const MAX_MEDIA = 14.5 * 1024 * 1024; // حد مرفقات ntfy.sh هو 15 ميغابايت
+const MAX_IMAGE_INPUT = 60 * 1024 * 1024; // الصور الكبيرة تُضغط قبل الإرسال
+const IMG_MAX_SIDE = 1920;
+const MEDIA_TTL = 2.5 * 3600e3; // ntfy.sh يحذف المرفقات بعد 3 ساعات
+const RESEND_AFTER = 11 * 3600e3; // ntfy.sh يحتفظ بالرسائل 12 ساعة
 const RESEND_MAX_AGE = 7 * 864e5;
 const PROFILE_EVERY = 3 * 3600e3;
+const DEMO_ID = 'demo';
 const AV_COLORS = ['stone', 'sand', 'sage', 'sky', 'lilac', 'rose'];
 const COLOR_NAMES = { stone: 'رمادي', sand: 'رملي', sage: 'أخضر', sky: 'سماوي', lilac: 'بنفسجي', rose: 'وردي' };
+const MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif', 'video/mp4', 'video/webm', 'video/quicktime', 'video/ogg'];
 const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const K = { id: 'mrsl.identity', state: 'mrsl.state', settings: 'mrsl.settings' };
 const DEFAULTS = {
@@ -28,6 +36,9 @@ const DEFAULTS = {
 const RANK = { failed: 0, sending: 0, sent: 1, delivered: 2, read: 3 };
 const ERR = {
   too_long: 'الرسالة طويلة جدًا.',
+  too_big: 'الملف كبير جدًا — الحد الأقصى 14 ميغابايت.',
+  type: 'يمكن إرسال الصور والفيديوهات فقط.',
+  decode: 'تعذّرت قراءة الملف. جرّب صورة JPG أو PNG أو فيديو MP4.',
   rate: 'أرسلت كثيرًا بسرعة، انتظر قليلًا ثم حاول.',
   network: 'تعذّر الاتصال. تحقق من الإنترنت.',
 };
@@ -45,6 +56,32 @@ const store = {
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
 
+// الصور والفيديوهات تُحفظ في IndexedDB لأنها أكبر من سعة localStorage
+const idb = (() => {
+  let dbp = null;
+  const open = () => (dbp ||= new Promise((resolve, reject) => {
+    const r = indexedDB.open('mrsl', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('media');
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  }));
+  const run = async (mode, fn) => {
+    const db = await open();
+    return new Promise((resolve, reject) => {
+      const t = db.transaction('media', mode);
+      const req = fn(t.objectStore('media'));
+      t.oncomplete = () => resolve(req.result);
+      t.onerror = () => reject(t.error);
+      t.onabort = () => reject(t.error);
+    });
+  };
+  return {
+    get: (k) => run('readonly', (s) => s.get(k)),
+    put: (k, v) => run('readwrite', (s) => s.put(v, k)),
+    del: (k) => run('readwrite', (s) => s.delete(k)).catch(() => {}),
+  };
+})();
+
 let me = store.get(K.id, null);
 let state = normalizeState(store.get(K.state, null));
 let settings = { ...DEFAULTS, ...store.get(K.settings, {}) };
@@ -56,6 +93,9 @@ let wiped = false;
 const drafts = {};
 const keyCache = new Map();
 const pendingReceipts = new Map();
+const blobUrls = new Map();
+const downloading = new Set();
+const typing = new Map();
 
 function normalizeState(s) {
   if (!s || s.v !== 1) s = { v: 1, contacts: {}, seen: {}, profileAt: 0 };
@@ -96,8 +136,11 @@ const validId = (id) => /^[0-9A-HJKMNP-TV-Z]{10}$/.test(id);
 const cleanName = (s) => String(s ?? '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 32);
 const initial = (name) => ([...String(name || '').trim()][0] || '؟').toUpperCase();
 const displayName = (c) => c.name || `مستخدم ${c.id.slice(0, 5)}`;
+const idLabel = (c) => (c.bot ? 'حساب تجريبي' : formatId(c.id));
 const isMobile = () => matchMedia('(max-width: 760px)').matches;
 const avatar = (name, color, cls = '') => `<div class="av av-${AV_COLORS.includes(color) ? color : 'stone'} ${cls}">${esc(initial(name))}</div>`;
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const clampInt = (v, max = 20000) => (Number.isFinite(+v) ? Math.max(0, Math.min(max, Math.round(+v))) : 0);
 
 function linkify(text) {
   return esc(text).replace(/\bhttps?:\/\/[^\s<]+[^\s<.,:;"')\]!?،]/g, (u) => `<a href="${u}" target="_blank" rel="noopener noreferrer nofollow">${u}</a>`);
@@ -106,6 +149,8 @@ function linkify(text) {
 const startOfDay = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); };
 const daysAgo = (t) => Math.round((startOfDay(Date.now()) - startOfDay(t)) / 864e5);
 const fmtTime = (t) => new Date(t).toLocaleTimeString(LOC, { hour: 'numeric', minute: '2-digit' });
+const fmtDur = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const fmtSize = (b) => (b < 1024 * 1024 ? `${Math.max(1, Math.round(b / 1024))} ك.ب` : `${(b / 1024 / 1024).toFixed(1)} م.ب`);
 function dayLabel(t) {
   const n = daysAgo(t);
   if (n === 0) return 'اليوم';
@@ -221,6 +266,66 @@ async function lookupProfile(id) {
   return null;
 }
 
+// رفع ملف مشفّر كمرفق ntfy على موضوع عشوائي مؤقت
+async function uploadMedia(m) {
+  const blob = await idb.get(m.id).catch(() => null);
+  if (!blob) throw new Error('missing');
+  const key = crypto.getRandomValues(new Uint8Array(32));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ck = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt']);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, ck, await blob.arrayBuffer());
+  let res;
+  try {
+    res = await fetch(`${NTFY}/${NS}-f-${rid()}?filename=m.bin`, { method: 'POST', body: new Blob([ct]) });
+  } catch { throw new Error('network'); }
+  if (res.status === 413) throw new Error('too_big');
+  if (res.status === 429) throw new Error('rate');
+  if (!res.ok) throw new Error('network');
+  const url = (await res.json().catch(() => null))?.attachment?.url;
+  if (typeof url !== 'string' || !url.startsWith(`${NTFY}/file/`)) throw new Error('network');
+  Object.assign(m.media, { u: url, key: b64e(key), iv: b64e(iv), upAt: Date.now() });
+}
+
+async function downloadMedia(c, m) {
+  if (!m.media || downloading.has(m.id)) return;
+  downloading.add(m.id);
+  m.media.st = 'downloading';
+  refreshMedia(c, m);
+  try {
+    const res = await fetch(m.media.u);
+    if (res.status === 404 || res.status === 410) {
+      m.media.st = 'expired';
+    } else {
+      if (!res.ok) throw new Error('network');
+      const ck = await crypto.subtle.importKey('raw', b64d(m.media.key), 'AES-GCM', false, ['decrypt']);
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(m.media.iv) }, ck, await res.arrayBuffer());
+      await idb.put(m.id, new Blob([pt], { type: m.media.mime }));
+      m.media.st = 'ready';
+    }
+  } catch {
+    m.media.st = 'error';
+  } finally {
+    downloading.delete(m.id);
+    save();
+    refreshMedia(c, m);
+  }
+  // انتهت صلاحية المرفق (المستلم كان غير متصل أكثر من 3 ساعات): نطلب من المرسل رفعه من جديد
+  if (m.media.st === 'expired' && !m.media.reqAt) requestResend(c, m);
+}
+
+async function requestResend(c, m) {
+  if (c.bot || !m.media) return;
+  m.media.reqAt = Date.now();
+  m.media.st = 'requested';
+  save();
+  refreshMedia(c, m);
+  try { await sendEnvelope(c, { t: 'q', id: m.id, n: me.name, c: me.color }); } catch {
+    m.media.st = 'expired';
+    save();
+    refreshMedia(c, m);
+  }
+}
+
 let queue = Promise.resolve();
 let connTimer = null;
 function subscribe() {
@@ -265,8 +370,23 @@ async function handleEvent(raw) {
   onInner(env.f, env.k, inner, (ev.time || Date.now() / 1000) * 1000);
 }
 
+function parseMediaWire(a) {
+  if (!a || typeof a !== 'object') return null;
+  const kind = a.k === 'image' || a.k === 'video' ? a.k : null;
+  if (!kind || typeof a.u !== 'string' || !a.u.startsWith(`${NTFY}/file/`) || typeof a.key !== 'string' || typeof a.iv !== 'string') return null;
+  const mime = MIMES.includes(a.m) && a.m.startsWith(kind) ? a.m : kind === 'image' ? 'image/jpeg' : 'video/mp4';
+  const thumb = typeof a.t === 'string' && a.t.startsWith('data:image/jpeg;base64,') && a.t.length < 3000 ? a.t : '';
+  return {
+    kind, mime, thumb,
+    w: clampInt(a.w), h: clampInt(a.h),
+    dur: Number(a.d) > 0 ? Math.min(Number(a.d), 36000) : 0,
+    size: clampInt(a.z, MAX_MEDIA * 2),
+    u: a.u, key: a.key, iv: a.iv, st: 'downloading',
+  };
+}
+
 function onInner(fromId, pub, inner, evTime) {
-  if (!inner || (inner.t !== 'm' && inner.t !== 'r')) return;
+  if (!inner || !['m', 'r', 'q'].includes(inner.t)) return;
   let c = state.contacts[fromId];
   if (c?.blocked) return;
   if (!c) {
@@ -279,31 +399,36 @@ function onInner(fromId, pub, inner, evTime) {
 
   if (inner.t === 'r') {
     applyReceipt(c, inner);
+  } else if (inner.t === 'q') {
+    // طلب إعادة رفع مرفق انتهت صلاحيته عند الطرف الآخر
+    const m = c.msgs.find((x) => x.me && x.id === inner.id && x.media);
+    if (m && Date.now() - (m.media.reqAt || 0) > 60e3) {
+      m.media.reqAt = Date.now();
+      deliver(c, m, { quiet: true, reupload: true });
+    }
   } else {
     const id = typeof inner.id === 'string' ? inner.id.slice(0, 32) : '';
     const text = typeof inner.x === 'string' ? inner.x.slice(0, MAX_TEXT) : '';
-    if (!id || !text.trim()) return;
+    const media = parseMediaWire(inner.a);
+    if (!id || (!text.trim() && !media)) return;
     const dup = c.msgs.find((m) => !m.me && m.id === id);
     if (dup) {
-      // المرسل أعاد الإرسال لأنه لم يستلم إشعار الوصول
+      // إعادة إرسال: إن كان المرفق منتهيًا عندنا نستخدم الرابط الجديد
+      if (dup.media && media && ['expired', 'error', 'requested'].includes(dup.media.st)) {
+        Object.assign(dup.media, media);
+        downloadMedia(c, dup);
+      }
       queueReceipt(c, dup.read ? 'r' : 'd', id);
+      save();
       return;
     }
     let ts = Number(inner.s);
     if (!Number.isFinite(ts) || ts > evTime + 5 * 60e3 || ts < evTime - RESEND_MAX_AGE - 864e5) ts = evTime;
     const m = { id, me: false, text, ts };
-    insertMsg(c, m);
-    const fresh = Date.now() - evTime < 5 * 60e3;
-    if (activeId === c.id && !document.hidden) {
-      m.read = true;
-      queueReceipt(c, 'r', id);
-      if (fresh) ping();
-    } else {
-      c.unread = (c.unread || 0) + 1;
-      queueReceipt(c, 'd', id);
-      if (fresh) alertIncoming(c, m);
-    }
-    if (activeId === c.id) appendMessage(c, m);
+    if (media) m.media = media;
+    receive(c, m, { fresh: Date.now() - evTime < 5 * 60e3 });
+    if (media) downloadMedia(c, m);
+    return;
   }
   save();
   renderList();
@@ -311,19 +436,46 @@ function onInner(fromId, pub, inner, evTime) {
   if (activeId === c.id) renderConvHead(c);
 }
 
+// إضافة رسالة واردة (من الشبكة أو من الحساب التجريبي)
+function receive(c, m, { fresh = true } = {}) {
+  insertMsg(c, m);
+  if (activeId === c.id && !document.hidden) {
+    m.read = true;
+    queueReceipt(c, 'r', m.id);
+    if (fresh) ping();
+  } else {
+    c.unread = (c.unread || 0) + 1;
+    queueReceipt(c, 'd', m.id);
+    if (fresh) alertIncoming(c, m);
+  }
+  if (activeId === c.id) { appendMessage(c, m); renderConvHead(c); }
+  save();
+  renderList();
+  updateTitle();
+}
+
 function applyReceipt(c, inner) {
   const upd = (ids, st) => {
     if (!Array.isArray(ids)) return;
     for (const id of ids.slice(0, 200)) {
       const m = c.msgs.find((x) => x.me && x.id === id);
-      if (m && RANK[st] > (RANK[m.status] ?? 0)) { m.status = st; refreshMsg(c, m); }
+      if (m) setStatus(c, m, st);
     }
   };
   upd(inner.d, 'delivered');
   upd(inner.r, 'read');
 }
 
+function setStatus(c, m, st) {
+  if (RANK[st] <= (RANK[m.status] ?? 0)) return;
+  m.status = st;
+  save();
+  refreshMsg(c, m);
+  renderList();
+}
+
 function queueReceipt(c, kind, id) {
+  if (c.bot) return;
   if (kind === 'r' && !settings.readReceipts) kind = 'd';
   const p = pendingReceipts.get(c.id) || { d: new Set(), r: new Set(), timer: 0 };
   p[kind].add(id);
@@ -337,7 +489,7 @@ async function flushReceipts(peerId) {
   const p = pendingReceipts.get(peerId);
   pendingReceipts.delete(peerId);
   const c = state.contacts[peerId];
-  if (!p || !c || c.blocked || suspended) return;
+  if (!p || !c || c.blocked || c.bot || suspended) return;
   const d = [...p.d].slice(-100), r = [...p.r].slice(-100);
   if (!d.length && !r.length) return;
   try { await sendEnvelope(c, { t: 'r', d, r, n: me.name, c: me.color }); } catch {}
@@ -352,8 +504,16 @@ function insertMsg(c, m) {
   let i = c.msgs.length;
   while (i > 0 && c.msgs[i - 1].ts > m.ts) i--;
   c.msgs.splice(i, 0, m);
-  if (c.msgs.length > MAX_MSGS) c.msgs.splice(0, c.msgs.length - MAX_MSGS);
+  if (c.msgs.length > MAX_MSGS) dropMedia(c.msgs.splice(0, c.msgs.length - MAX_MSGS));
   c.updated = Math.max(c.updated || 0, m.ts);
+}
+
+function dropMedia(msgs) {
+  for (const m of msgs) {
+    if (!m.media) continue;
+    idb.del(m.id);
+    if (blobUrls.has(m.id)) { URL.revokeObjectURL(blobUrls.get(m.id)); blobUrls.delete(m.id); }
+  }
 }
 
 function sendCurrent() {
@@ -373,10 +533,36 @@ function sendCurrent() {
   deliver(c, m);
 }
 
-async function deliver(c, m, { quiet = false } = {}) {
+async function sendMedia(c, prep, caption) {
+  const m = {
+    id: rid(), me: true, text: caption, ts: Date.now(), status: 'sending',
+    media: { kind: prep.kind, mime: prep.mime, w: prep.w, h: prep.h, thumb: prep.thumb, dur: prep.dur, size: prep.blob.size },
+  };
+  try { await idb.put(m.id, prep.blob); } catch { return toast('لا توجد مساحة كافية على الجهاز.', 'error'); }
+  insertMsg(c, m);
+  save();
+  appendMessage(c, m);
+  renderList();
+  deliver(c, m);
+}
+
+async function deliver(c, m, { quiet = false, reupload = false } = {}) {
+  if (c.bot) return botHandle(c, m);
   if (!quiet) { m.status = 'sending'; refreshMsg(c, m); }
   try {
-    await sendEnvelope(c, { t: 'm', id: m.id, x: m.text, s: m.ts, n: me.name, c: me.color });
+    const inner = { t: 'm', id: m.id, x: m.text, s: m.ts, n: me.name, c: me.color };
+    if (m.media) {
+      if (reupload || !m.media.u || Date.now() - (m.media.upAt || 0) > MEDIA_TTL) await uploadMedia(m);
+      const md = m.media;
+      inner.a = { k: md.kind, m: md.mime, w: md.w, h: md.h, t: md.thumb, d: md.dur, z: md.size, u: md.u, key: md.key, iv: md.iv };
+    }
+    try {
+      await sendEnvelope(c, inner);
+    } catch (err) {
+      if (err.message !== 'too_long' || !inner.a?.t) throw err;
+      inner.a.t = ''; // بدون الصورة المصغّرة إن تجاوزت الرسالة الحد
+      await sendEnvelope(c, inner);
+    }
     m.pubAt = Date.now();
     if ((RANK[m.status] ?? 0) < RANK.sent) m.status = 'sent';
   } catch (err) {
@@ -401,7 +587,7 @@ function resendStale() {
   const now = Date.now();
   let budget = 20;
   for (const c of Object.values(state.contacts)) {
-    if (c.blocked) continue;
+    if (c.blocked || c.bot) continue;
     for (const m of c.msgs) {
       if (budget <= 0) return;
       if (m.me && m.status === 'sent' && now - (m.pubAt || m.ts) > RESEND_AFTER && now - m.ts < RESEND_MAX_AGE) {
@@ -425,6 +611,194 @@ function markChatRead(c) {
   if (changed) save();
 }
 
+// ---------- تجهيز الصور والفيديو ----------
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+function drawTo(source, w, h, maxSide) {
+  const scale = Math.min(1, maxSide / Math.max(w, h));
+  const cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(w * scale));
+  cv.height = Math.max(1, Math.round(h * scale));
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(source, 0, 0, cv.width, cv.height);
+  return cv;
+}
+const toBlob = (cv, q = 0.85) => new Promise((resolve, reject) => cv.toBlob((b) => (b ? resolve(b) : reject(new Error('decode'))), 'image/jpeg', q));
+const makeThumb = (source, w, h) => drawTo(source, w, h, 20).toDataURL('image/jpeg', 0.5);
+
+async function prepareMedia(file) {
+  const kind = file.type.startsWith('image/') ? 'image' : file.type.startsWith('video/') ? 'video' : null;
+  if (!kind) throw new Error('type');
+  const url = URL.createObjectURL(file);
+  try {
+    if (kind === 'image') {
+      if (file.size > MAX_IMAGE_INPUT) throw new Error('too_big');
+      const img = await loadImage(url).catch(() => { throw new Error('decode'); });
+      const w = img.naturalWidth, h = img.naturalHeight;
+      let blob = file, mime = file.type;
+      const keepGif = file.type === 'image/gif' && file.size <= MAX_MEDIA;
+      if (!keepGif && (!MIMES.includes(file.type) || Math.max(w, h) > IMG_MAX_SIDE || file.size > 1.5 * 1024 * 1024)) {
+        blob = await toBlob(drawTo(img, w, h, IMG_MAX_SIDE));
+        mime = 'image/jpeg';
+      }
+      if (blob.size > MAX_MEDIA) throw new Error('too_big');
+      const scale = Math.min(1, IMG_MAX_SIDE / Math.max(w, h));
+      return { kind, mime, blob, w: Math.round(w * scale), h: Math.round(h * scale), thumb: makeThumb(img, w, h), dur: 0 };
+    }
+    if (file.size > MAX_MEDIA) throw new Error('too_big');
+    const v = document.createElement('video');
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    v.src = url;
+    const wait = (ev, ms) => new Promise((resolve) => { v.addEventListener(ev, resolve, { once: true }); v.addEventListener('error', resolve, { once: true }); setTimeout(resolve, ms); });
+    await wait('loadeddata', 5000);
+    let thumb = '';
+    const w = v.videoWidth, h = v.videoHeight, dur = Number.isFinite(v.duration) ? v.duration : 0;
+    if (w && h) {
+      v.currentTime = Math.min(0.5, dur / 2 || 0);
+      await wait('seeked', 2000);
+      try { thumb = makeThumb(v, w, h); } catch {}
+    }
+    return { kind, mime: MIMES.includes(file.type) ? file.type : 'video/mp4', blob: file, w, h, thumb, dur };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function pickFile(file) {
+  const c = state.contacts[activeId];
+  if (!c || c.blocked || !file) return;
+  let prep;
+  try { prep = await prepareMedia(file); } catch (err) { return toast(ERR[err.message] || ERR.decode, 'error'); }
+  const caption = await previewDialog(prep);
+  if (caption !== null) sendMedia(c, prep, caption);
+}
+
+// ---------- الحساب التجريبي ----------
+// شخص وهمي يعيش داخل الجهاز فقط: يرد تلقائيًا ويحاكي علامات الصح، ولا يرسل شيئًا للإنترنت.
+function ensureDemo(force = false) {
+  if (state.contacts[DEMO_ID]) return state.contacts[DEMO_ID];
+  if (!force && state.demoAdded) return null;
+  state.demoAdded = true;
+  const c = state.contacts[DEMO_ID] = { ...newContact({ id: DEMO_ID, pub: '', name: 'سالم (تجريبي)', color: 'sky' }), bot: true };
+  const now = Date.now();
+  insertMsg(c, { id: rid(), me: false, ts: now, text: 'أهلًا! 👋 أنا سالم، حساب تجريبي داخل جهازك فقط وأرد عليك تلقائيًا.' });
+  insertMsg(c, { id: rid(), me: false, ts: now + 1, text: 'اكتب لي أي شيء، أو أرسل صورة أو فيديو من زر 🖼️ — وراقب علامات الصح ✓ ✓✓' });
+  c.unread = 2;
+  save();
+  return c;
+}
+
+function setTyping(c, on) {
+  const n = Math.max(0, (typing.get(c.id) || 0) + (on ? 1 : -1));
+  typing.set(c.id, n);
+  renderList();
+  if (activeId !== c.id) return;
+  renderConvHead(c);
+  const box = $('#messages');
+  const row = $('.typing-row', box);
+  if (n && !row) {
+    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    box.insertAdjacentHTML('beforeend', '<div class="msg in typing-row new"><div class="bubble typing"><i></i><i></i><i></i></div></div>');
+    if (stick) box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
+  } else if (!n && row) row.remove();
+}
+
+function botHandle(c, m) {
+  const alive = () => state.contacts[c.id] === c && !c.blocked;
+  const later = (ms, fn) => setTimeout(() => { if (alive()) fn(); }, ms);
+  later(350, () => setStatus(c, m, 'sent'));
+  later(900, () => setStatus(c, m, 'delivered'));
+  const reply = botReply(c, m);
+  later(1600, () => { setStatus(c, m, 'read'); setTyping(c, true); });
+  later(1600 + reply.delay, async () => {
+    const r = { id: rid(), me: false, text: reply.text, ts: Date.now() };
+    if (reply.image) {
+      try {
+        const img = await botImage();
+        await idb.put(r.id, img.blob);
+        r.media = { kind: 'image', mime: 'image/jpeg', w: img.w, h: img.h, thumb: img.thumb, dur: 0, size: img.blob.size, st: 'ready' };
+      } catch {}
+    }
+    setTyping(c, false);
+    receive(c, r);
+  });
+}
+
+function botReply(c, m) {
+  const t = String(m.text || '').replace(/[ً-ْـ]/g, '').toLowerCase();
+  const has = (...w) => w.some((x) => t.includes(x));
+  let text = '', image = false;
+  if (m.media) text = m.media.kind === 'image' ? pick(['صورة حلوة! 📸 وصلتني بدون مشاكل.', 'وصلت الصورة ✅ شفت كيف تتحمّل؟']) : pick(['وصلني الفيديو 🎬 شغّال تمام!', 'فيديو رهيب! 👌 وصل كامل.']);
+  else if (has('السلام', 'سلام')) text = 'وعليكم السلام ورحمة الله 🌿';
+  else if (has('كيف حالك', 'كيفك', 'شلونك', 'اخبارك', 'أخبارك')) text = 'بخير الحمد لله 😊 وأنت؟';
+  else if (has('مرحبا', 'هلا', 'اهلا', 'أهلا', 'hi', 'hello')) text = 'هلا والله! 👋 جرّب ترسل لي صورة.';
+  else if (has('صورة', 'صوره', 'صور')) { text = 'تفضل، سويت لك هذي الصورة 🎨'; image = true; }
+  else if (has('اسمك', 'من انت', 'مين انت', 'من أنت')) text = 'أنا سالم، حساب تجريبي يعيش داخل جهازك فقط. رسائلي ما تطلع للإنترنت 🙂';
+  else if (has('شكرا', 'مشكور', 'يعطيك')) text = 'العفو! 🌹';
+  else if (has('تست', 'test', 'تجربة', 'تجربه')) text = 'التجربة ناجحة ✅ الرسالة وصلت وقريتها.';
+  else if (has('ثيم', 'داكن', 'ليلي')) text = 'تقدر تغيّر الثيم من الإعدادات ⚙️ ← المظهر.';
+  else {
+    const short = [...String(m.text)].slice(0, 40).join('');
+    text = pick([`وصلتني رسالتك: «${short}» ✅`, 'تمام 👍', 'اكتب "صورة" وأرسل لك صورة 🎨', 'جرّب ترسل لي فيديو قصير 🎬', 'تقدر توقف إشعارات القراءة من الإعدادات 👀', 'حلو! 😄']);
+  }
+  return { text, image, delay: 700 + Math.min(1800, text.length * 30) };
+}
+
+async function botImage() {
+  const w = 800, h = 520;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  const palettes = [['#e2ebf8', '#f3e9dc'], ['#e2eee5', '#ede6f6'], ['#f7e4e4', '#e2ebf8'], ['#ede6f6', '#f3e9dc']];
+  const [a, b] = pick(palettes);
+  const g = ctx.createLinearGradient(0, 0, w, h);
+  g.addColorStop(0, a);
+  g.addColorStop(1, b);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  for (let i = 0; i < 14; i++) {
+    ctx.fillStyle = `rgba(255,255,255,${0.15 + Math.random() * 0.25})`;
+    ctx.beginPath();
+    ctx.arc(Math.random() * w, Math.random() * h, 20 + Math.random() * 90, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.save();
+  ctx.translate(w / 2 - 60, 130);
+  ctx.scale(1.25, 1.25);
+  ctx.fillStyle = '#0c0c0d';
+  ctx.beginPath();
+  ctx.roundRect(0, 0, 96, 96, 28);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.fill(new Path2D('M30 24h36a12 12 0 0 1 12 12v22a12 12 0 0 1-12 12H44l-12 10v-10h-2a12 12 0 0 1-12-12V36a12 12 0 0 1 12-12z'));
+  ctx.strokeStyle = '#0c0c0d';
+  ctx.lineWidth = 5.5;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke(new Path2D('M33 48l7 7 13-14M47 52l3 3 13-14'));
+  ctx.restore();
+  ctx.fillStyle = '#0c0c0d';
+  ctx.textAlign = 'center';
+  ctx.direction = 'rtl';
+  ctx.font = "700 54px 'IBM Plex Sans Arabic', sans-serif";
+  ctx.fillText('مرسال', w / 2, 360);
+  ctx.font = "400 26px 'IBM Plex Sans Arabic', sans-serif";
+  ctx.fillStyle = '#5f5f66';
+  ctx.fillText('صورة تجريبية من سالم', w / 2, 410);
+  return { blob: await toBlob(cv, 0.9), w, h, thumb: makeThumb(cv, w, h) };
+}
+
 // ---------- الحفظ ----------
 let saveTimer = null;
 function save() { clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 250); }
@@ -434,7 +808,7 @@ function saveNow() {
   const cutoff = Date.now() / 1000 - 13 * 3600;
   for (const k in state.seen) if (state.seen[k] < cutoff) delete state.seen[k];
   if (!store.set(K.state, state)) {
-    for (const c of Object.values(state.contacts)) c.msgs = c.msgs.slice(-100);
+    for (const c of Object.values(state.contacts)) dropMedia(c.msgs.splice(0, Math.max(0, c.msgs.length - 100)));
     store.set(K.state, state);
   }
 }
@@ -452,6 +826,12 @@ function tick(status) {
   }
 }
 
+function previewHtml(m) {
+  if (!m.media) return `<span class="ci-prev-t">${esc(m.text)}</span>`;
+  const img = m.media.kind === 'image';
+  return `<span class="ms ci-ic">${img ? 'photo_camera' : 'videocam'}</span><span class="ci-prev-t">${esc(m.text || (img ? 'صورة' : 'فيديو'))}</span>`;
+}
+
 function renderList() {
   const box = $('#chatList');
   const all = Object.values(state.contacts);
@@ -461,7 +841,7 @@ function renderList() {
       <b>لا توجد محادثات بعد</b>
       <p>أضف صديقًا بمعرّفه، أو شارك معرّفك ليبدأ بمراسلتك.</p>
       <button class="btn btn-primary" data-act="new-chat" type="button"><span class="ms">person_add</span> محادثة جديدة</button>
-      <button class="id-card" data-act="copy-id" type="button"><span class="id-label">معرّفك</span><bdi class="id-val">${formatId(me.id)}</bdi><span class="ms">content_copy</span></button>
+      <button class="btn btn-soft" data-act="demo" type="button"><span class="ms">smart_toy</span> جرّب مع حساب تجريبي</button>
     </div>`;
     return;
   }
@@ -473,9 +853,10 @@ function renderList() {
   if (!list.length) { box.innerHTML = '<div class="list-note">لا توجد نتائج</div>'; return; }
   box.innerHTML = list.map((c) => {
     const last = c.msgs[c.msgs.length - 1];
-    const prev = last
-      ? (last.me ? tick(last.status) : '') + `<span class="ci-prev-t">${esc(last.text)}</span>`
-      : `<span class="ci-prev-t muted">${c.blocked ? 'محظور' : 'ابدأ المحادثة 👋'}</span>`;
+    let prev;
+    if (typing.get(c.id)) prev = '<span class="ci-prev-t typing-t">يكتب…</span>';
+    else if (last) prev = (last.me ? tick(last.status) : '') + previewHtml(last);
+    else prev = `<span class="ci-prev-t muted">${c.blocked ? 'محظور' : 'ابدأ المحادثة 👋'}</span>`;
     return `<button class="chat-item${c.id === activeId ? ' active' : ''}${c.unread ? ' unread' : ''}" data-id="${esc(c.id)}" type="button">
       ${avatar(displayName(c), c.color)}
       <div class="ci-body">
@@ -486,6 +867,31 @@ function renderList() {
   }).join('');
 }
 
+function mediaState(m) {
+  if (m.me) return m.status === 'sending' ? 'uploading' : 'ready';
+  return m.media.st || 'ready';
+}
+
+function mediaHtml(m) {
+  const md = m.media;
+  const st = mediaState(m);
+  const ratio = md.w && md.h ? Math.min(Math.max(md.w / md.h, 0.56), 1.9) : md.kind === 'video' ? 16 / 9 : 4 / 3;
+  let body = '';
+  if (st === 'ready' || st === 'uploading') {
+    body = md.kind === 'image'
+      ? `<img class="mb-full" data-src="${esc(m.id)}" alt="صورة">`
+      : `<video class="mb-full" data-src="${esc(m.id)}" controls playsinline preload="metadata"></video>`;
+  }
+  let overlay = '';
+  if (st === 'uploading' || st === 'downloading') overlay = '<div class="mb-state"><span class="spinner lg"></span></div>';
+  else if (st === 'error') overlay = '<button class="mb-state" data-media-retry type="button"><span class="ms">refresh</span><small>تعذّر التحميل — اضغط للمحاولة</small></button>';
+  else if (st === 'expired') overlay = '<button class="mb-state" data-media-req type="button"><span class="ms">history</span><small>انتهت صلاحية الملف — اضغط لطلبه من جديد</small></button>';
+  else if (st === 'requested') overlay = '<div class="mb-state"><span class="ms">hourglass_top</span><small>بانتظار إعادة الإرسال من المرسل…</small></div>';
+  const dur = md.kind === 'video' && md.dur && st !== 'ready' ? `<span class="mb-dur"><span class="ms">videocam</span>${fmtDur(md.dur)}</span>` : '';
+  const thumb = md.thumb ? `<img class="mb-thumb" src="${esc(md.thumb)}" alt="">` : '';
+  return `<div class="mb" data-st="${st}" style="aspect-ratio:${ratio.toFixed(3)}">${thumb}${body}${overlay}${dur}</div>`;
+}
+
 function msgHtml(m, prev, isNew) {
   let h = '';
   const newDay = !prev || startOfDay(prev.ts) !== startOfDay(m.ts);
@@ -493,7 +899,36 @@ function msgHtml(m, prev, isNew) {
   const cont = !newDay && prev.me === m.me && m.ts - prev.ts < 5 * 60e3;
   const cls = ['msg', m.me ? 'out' : 'in', cont && 'cont', isNew && 'new', m.status === 'failed' && 'failed'].filter(Boolean).join(' ');
   const title = m.status === 'failed' ? ' title="لم تُرسل — اضغط لإعادة المحاولة"' : '';
-  return `${h}<div class="${cls}" data-id="${esc(m.id)}"${title}><div class="bubble"><span class="txt">${linkify(m.text)}</span><span class="meta"><time>${fmtTime(m.ts)}</time>${m.me ? tick(m.status) : ''}</span></div></div>`;
+  const meta = `<span class="meta"><time>${fmtTime(m.ts)}</time>${m.me ? tick(m.status) : ''}</span>`;
+  if (m.media) {
+    const bcls = ['bubble', 'media', !m.text && 'bare', m.media.kind === 'video' && 'has-video'].filter(Boolean).join(' ');
+    return `${h}<div class="${cls}" data-id="${esc(m.id)}"${title}><div class="${bcls}">${mediaHtml(m)}${m.text ? `<span class="txt">${linkify(m.text)}</span>` : ''}${meta}</div></div>`;
+  }
+  return `${h}<div class="${cls}" data-id="${esc(m.id)}"${title}><div class="bubble"><span class="txt">${linkify(m.text)}</span>${meta}</div></div>`;
+}
+
+function hydrate(root) {
+  $$('[data-src]:not([src])', root).forEach(async (el) => {
+    const id = el.dataset.src;
+    let url = blobUrls.get(id);
+    if (!url) {
+      const blob = await idb.get(id).catch(() => null);
+      if (!blob) return;
+      url = blobUrls.get(id) || URL.createObjectURL(blob);
+      blobUrls.set(id, url);
+    }
+    if (el.tagName === 'VIDEO') {
+      el.addEventListener('loadeddata', () => el.classList.add('loaded'), { once: true });
+      el.src = `${url}#t=0.1`;
+    } else {
+      el.addEventListener('load', () => el.classList.add('loaded'), { once: true });
+      el.src = url;
+    }
+  });
+}
+
+function typingRowHtml() {
+  return '<div class="msg in typing-row"><div class="bubble typing"><i></i><i></i><i></i></div></div>';
 }
 
 function renderMessages(c) {
@@ -502,12 +937,13 @@ function renderMessages(c) {
     box.innerHTML = `<div class="conv-empty">
       ${avatar(displayName(c), c.color, 'av-lg')}
       <b>${esc(displayName(c))}</b>
-      <bdi>${formatId(c.id)}</bdi>
-      <p>🔒 الرسائل في هذه المحادثة مشفّرة من طرف إلى طرف. قل مرحبًا 👋</p>
-    </div>`;
+      <bdi${c.bot ? ' class="plain"' : ''}>${esc(idLabel(c))}</bdi>
+      <p>${c.bot ? '🤖 هذا حساب تجريبي داخل جهازك فقط. اكتب له أي شيء 👋' : '🔒 الرسائل في هذه المحادثة مشفّرة من طرف إلى طرف. قل مرحبًا 👋'}</p>
+    </div>${typing.get(c.id) ? typingRowHtml() : ''}`;
     return;
   }
-  box.innerHTML = c.msgs.map((m, i) => msgHtml(m, c.msgs[i - 1], false)).join('');
+  box.innerHTML = c.msgs.map((m, i) => msgHtml(m, c.msgs[i - 1], false)).join('') + (typing.get(c.id) ? typingRowHtml() : '');
+  hydrate(box);
   box.scrollTop = box.scrollHeight;
 }
 
@@ -520,7 +956,11 @@ function appendMessage(c, m) {
     return;
   }
   const stick = m.me || box.scrollHeight - box.scrollTop - box.clientHeight < 120;
-  box.insertAdjacentHTML('beforeend', msgHtml(m, c.msgs[i - 1], true));
+  const html = msgHtml(m, c.msgs[i - 1], true);
+  const tr = $('.typing-row', box);
+  if (tr) tr.insertAdjacentHTML('beforebegin', html);
+  else box.insertAdjacentHTML('beforeend', html);
+  hydrate(box);
   if (stick) box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
 }
 
@@ -533,12 +973,31 @@ function refreshMsg(c, m) {
   else el.removeAttribute('title');
   const t = $('.tick', el);
   if (t) t.outerHTML = tick(m.status);
+  if (m.media) refreshMedia(c, m);
+}
+
+function refreshMedia(c, m) {
+  if (c.id !== activeId) return;
+  const el = $(`#messages .msg[data-id="${CSS.escape(m.id)}"] .mb`);
+  if (!el || el.dataset.st === mediaState(m)) return;
+  // نحافظ على عنصر الصورة/الفيديو إن كان جاهزًا لتجنّب الوميض
+  const keep = $('.mb-full[src]', el);
+  el.outerHTML = mediaHtml(m);
+  const fresh = $(`#messages .msg[data-id="${CSS.escape(m.id)}"] .mb`);
+  const slot = $('.mb-full', fresh);
+  if (keep && slot) slot.replaceWith(keep);
+  hydrate(fresh);
 }
 
 function renderConvHead(c) {
   $('#convAv').innerHTML = avatar(displayName(c), c.color, 'av-sm');
   $('#convName').textContent = displayName(c);
-  $('#convSub').textContent = formatId(c.id);
+  const isTyping = !!typing.get(c.id);
+  $('#convSubWrap').classList.toggle('typing', isTyping);
+  $('#convSubIcon').textContent = c.bot ? 'smart_toy' : 'lock';
+  $('#convSubIcon').hidden = isTyping;
+  $('#convSub').textContent = isTyping ? 'يكتب…' : idLabel(c);
+  $('#convSub').classList.toggle('plain', isTyping || !!c.bot);
   $('#blockLabel').textContent = c.blocked ? 'إلغاء الحظر' : 'حظر';
   $('#blockedBar').hidden = !c.blocked;
   $('#composer').hidden = !!c.blocked;
@@ -598,7 +1057,7 @@ function openDrawer(name) {
   if (name === 'newChat') {
     $('#newId').value = '';
     $('#newResult').innerHTML = '';
-    setTimeout(() => $('#newId').focus(), 320);
+    if (!isMobile()) setTimeout(() => $('#newId').focus(), 320);
   }
   if (name === 'settings') renderSettings();
 }
@@ -607,22 +1066,33 @@ function closeDrawers() { $$('.drawer.open').forEach((d) => d.classList.remove('
 function toggleMenu() { $('#convMenu').hidden = !$('#convMenu').hidden; }
 function closeMenu() { $('#convMenu').hidden = true; }
 
+function openDemo() {
+  const c = ensureDemo(true);
+  closeDrawers();
+  openChat(c.id);
+}
+
 async function convAction(act) {
   closeMenu();
   const c = state.contacts[activeId];
   if (!c) return;
-  if (act === 'copy') copy(formatId(c.id), 'تم نسخ المعرّف');
+  if (act === 'copy') {
+    if (c.bot) toast('هذا حساب تجريبي بلا معرّف', 'smart_toy');
+    else copy(formatId(c.id), 'تم نسخ المعرّف');
+  }
   if (act === 'block') toggleBlock(c.id);
   if (act === 'clear') {
     const ok = await confirmDialog({ title: 'مسح الرسائل؟', text: `ستُحذف رسائل المحادثة مع ${displayName(c)} من هذا الجهاز فقط.`, ok: 'مسح', danger: true });
     if (!ok) return;
+    dropMedia(c.msgs);
     c.msgs = [];
     c.unread = 0;
     save(); renderMessages(c); renderList(); updateTitle();
   }
   if (act === 'delete') {
-    const ok = await confirmDialog({ title: 'حذف المحادثة؟', text: `ستُحذف المحادثة مع ${displayName(c)} من هذا الجهاز. إذا راسلك مجددًا ستظهر من جديد.`, ok: 'حذف', danger: true });
+    const ok = await confirmDialog({ title: 'حذف المحادثة؟', text: `ستُحذف المحادثة مع ${displayName(c)} من هذا الجهاز.${c.bot ? ' يمكنك إرجاعه من «محادثة جديدة».' : ' إذا راسلك مجددًا ستظهر من جديد.'}`, ok: 'حذف', danger: true });
     if (!ok) return;
+    dropMedia(c.msgs);
     delete state.contacts[c.id];
     save();
     if (history.state?.chat) history.back(); else closeChat();
@@ -740,7 +1210,7 @@ function renderSettings() {
 function renderBlocked() {
   const list = Object.values(state.contacts).filter((c) => c.blocked);
   $('#blockedList').innerHTML = list.length
-    ? list.map((c) => `<div class="row">${avatar(displayName(c), c.color, 'av-sm')}<span class="row-text"><b>${esc(displayName(c))}</b><small><bdi>${formatId(c.id)}</bdi></small></span><button class="btn btn-soft btn-sm" data-unblock="${esc(c.id)}" type="button">إلغاء الحظر</button></div>`).join('')
+    ? list.map((c) => `<div class="row">${avatar(displayName(c), c.color, 'av-sm')}<span class="row-text"><b>${esc(displayName(c))}</b><small><bdi>${esc(idLabel(c))}</bdi></small></span><button class="btn btn-soft btn-sm" data-unblock="${esc(c.id)}" type="button">إلغاء الحظر</button></div>`).join('')
     : '<div class="row"><span class="ms">block</span><span class="row-text"><b>المحظورون</b><small>لا يوجد أحد محظور.</small></span></div>';
 }
 
@@ -761,7 +1231,7 @@ function renderSwatches(el, current, onPick) {
   };
 }
 
-// ---------- تنبيهات ----------
+// ---------- تنبيهات ونوافذ ----------
 let audioCtx = null;
 function ping() {
   if (!settings.sound) return;
@@ -785,8 +1255,9 @@ function ping() {
 function alertIncoming(c, m) {
   ping();
   if (!settings.notify || !document.hidden || !('Notification' in window) || Notification.permission !== 'granted') return;
+  const body = m.media ? `${m.media.kind === 'image' ? '📷 صورة' : '🎬 فيديو'}${m.text ? ` — ${m.text}` : ''}` : m.text;
   try {
-    const n = new Notification(displayName(c), { body: m.text.slice(0, 140), tag: c.id, icon: 'assets/logo.svg' });
+    const n = new Notification(displayName(c), { body: body.slice(0, 140), tag: c.id, icon: 'assets/logo.svg' });
     n.onclick = () => { window.focus(); openChat(c.id); n.close(); };
   } catch {}
 }
@@ -815,33 +1286,80 @@ async function copy(text, msg = 'تم النسخ') {
   toast(msg, 'content_copy');
 }
 
-function confirmDialog({ title, text, ok = 'تأكيد', cancel = 'إلغاء', danger = false }) {
+// نافذة عامة: تعرض المحتوى وتعيد قيمة عند الإغلاق
+function openModal(html, setup) {
   return new Promise((resolve) => {
     const m = $('#modal');
-    m.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true">
+    m.innerHTML = html;
+    m.hidden = false;
+    let cleanup = null;
+    const done = (v) => {
+      m.hidden = true;
+      m.innerHTML = '';
+      document.removeEventListener('keydown', onKey, true);
+      cleanup?.();
+      resolve(v);
+    };
+    const onKey = (e) => { if (e.key === 'Escape' && m.dataset.dismiss !== 'no') { e.stopPropagation(); done(null); } };
+    document.addEventListener('keydown', onKey, true);
+    m.onclick = (e) => { if (e.target === m && m.dataset.dismiss !== 'no') done(null); };
+    cleanup = setup(m, done);
+  });
+}
+
+function confirmDialog({ title, text, ok = 'تأكيد', cancel = 'إلغاء', danger = false }) {
+  $('#modal').dataset.dismiss = cancel ? 'yes' : 'no';
+  return openModal(`<div class="modal-card" role="dialog" aria-modal="true">
       <h3>${esc(title)}</h3><p>${esc(text)}</p>
       <div class="modal-actions">
         ${cancel ? `<button class="btn btn-soft" data-r="0" type="button">${esc(cancel)}</button>` : ''}
         <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-r="1" type="button">${esc(ok)}</button>
       </div>
-    </div>`;
-    m.hidden = false;
-    const done = (v) => {
-      m.hidden = true;
-      m.innerHTML = '';
-      document.removeEventListener('keydown', onKey, true);
-      resolve(v);
-    };
-    const onKey = (e) => { if (e.key === 'Escape' && cancel) { e.stopPropagation(); done(false); } };
-    document.addEventListener('keydown', onKey, true);
-    m.onclick = (e) => {
-      const b = e.target.closest('[data-r]');
-      if (b) done(b.dataset.r === '1');
-      else if (e.target === m && cancel) done(false);
-    };
+    </div>`, (m, done) => {
+    $$('[data-r]', m).forEach((b) => { b.onclick = () => done(b.dataset.r === '1'); });
     setTimeout(() => $('[data-r="1"]', m)?.focus(), 50);
+  }).then((v) => v === true);
+}
+
+function previewDialog(prep) {
+  const url = URL.createObjectURL(prep.blob);
+  const img = prep.kind === 'image';
+  $('#modal').dataset.dismiss = 'yes';
+  return openModal(`<div class="modal-card preview" role="dialog" aria-modal="true">
+      <div class="pv-head">
+        <button class="icon-btn" data-close-pv type="button" aria-label="إلغاء"><span class="ms">close</span></button>
+        <b>${img ? 'إرسال صورة' : 'إرسال فيديو'}</b>
+        <span class="pv-size">${fmtSize(prep.blob.size)}${prep.dur ? ` · ${fmtDur(prep.dur)}` : ''}</span>
+      </div>
+      <div class="pv-media">${img ? `<img src="${url}" alt="">` : `<video src="${url}" controls playsinline muted></video>`}</div>
+      <form class="pv-row">
+        <input class="input" id="pvCaption" placeholder="أضف تعليقًا (اختياري)" maxlength="${MAX_CAPTION}" autocomplete="off" />
+        <button class="send-btn" type="submit" aria-label="إرسال"><span class="ms fill flip">send</span></button>
+      </form>
+    </div>`, (m, done) => {
+    $('[data-close-pv]', m).onclick = () => done(null);
+    $('form', m).onsubmit = (e) => {
+      e.preventDefault();
+      done(String($('#pvCaption').value || '').trim().slice(0, MAX_CAPTION));
+    };
+    if (!isMobile()) setTimeout(() => $('#pvCaption').focus(), 50);
+    return () => URL.revokeObjectURL(url);
   });
 }
+
+function openViewer(src, id) {
+  const v = $('#viewer');
+  const md = Object.values(state.contacts).flatMap((c) => c.msgs).find((x) => x.id === id)?.media;
+  const ext = (md?.mime || 'image/jpeg').split('/')[1].replace('jpeg', 'jpg');
+  v.innerHTML = `<div class="viewer-bar">
+      <button class="icon-btn" data-close-viewer type="button" aria-label="إغلاق"><span class="ms">close</span></button>
+      <a class="icon-btn" href="${esc(src)}" download="mersal-${esc(id)}.${esc(ext)}" aria-label="حفظ"><span class="ms">download</span></a>
+    </div>
+    <img src="${esc(src)}" alt="">`;
+  v.hidden = false;
+  v.onclick = (e) => { if (e.target === v || e.target.closest('[data-close-viewer]')) closeViewer(); };
+}
+function closeViewer() { $('#viewer').hidden = true; $('#viewer').innerHTML = ''; }
 
 function shake(el) {
   el.classList.remove('shake');
@@ -881,7 +1399,7 @@ function showOnboard() {
   $('#onboard').hidden = false;
   obStep('welcome');
   renderSwatches($('#obColors'), obColor, (c) => { obColor = c; });
-  setTimeout(() => $('#obName').focus(), 100);
+  if (!isMobile()) setTimeout(() => $('#obName').focus(), 100);
 }
 
 async function startApp() {
@@ -896,12 +1414,17 @@ async function startApp() {
   $('#onboard').hidden = true;
   $('#app').hidden = false;
   channel?.postMessage({ t: 'takeover' });
+  ensureDemo();
   renderMe();
   renderList();
   updateTitle();
   subscribe();
   publishProfile();
   handleHash();
+  // استكمال تنزيل المرفقات التي انقطع تنزيلها
+  for (const c of Object.values(state.contacts)) {
+    for (const m of c.msgs) if (!m.me && m.media?.st === 'downloading') downloadMedia(c, m);
+  }
   setTimeout(resendStale, 5000);
   setInterval(resendStale, 10 * 60e3);
   setInterval(() => publishProfile(), 30 * 60e3);
@@ -958,8 +1481,16 @@ function bindUI() {
   $('#convMenu').onclick = (e) => { const b = e.target.closest('[data-act]'); if (b) convAction(b.dataset.act); };
   $('#unblockBtn').onclick = () => toggleBlock(activeId);
   $('#messages').onclick = (e) => {
-    const m = e.target.closest('.msg.failed');
-    if (m && !e.target.closest('a')) retry(m.dataset.id);
+    const c = state.contacts[activeId];
+    const row = e.target.closest('.msg');
+    if (!c || !row) return;
+    const m = c.msgs.find((x) => x.id === row.dataset.id);
+    if (!m) return;
+    const img = e.target.closest('img.mb-full.loaded');
+    if (img) return openViewer(img.src, m.id);
+    if (e.target.closest('[data-media-retry]')) return downloadMedia(c, m);
+    if (e.target.closest('[data-media-req]')) return requestResend(c, m);
+    if (row.classList.contains('failed') && !e.target.closest('a, video')) retry(m.id);
   };
   input.addEventListener('input', () => { autosize(); if (activeId) drafts[activeId] = input.value; });
   input.addEventListener('keydown', (e) => {
@@ -968,7 +1499,31 @@ function bindUI() {
       sendCurrent();
     }
   });
+  input.addEventListener('paste', (e) => {
+    const f = [...(e.clipboardData?.files || [])].find((x) => /^(image|video)\//.test(x.type));
+    if (f) { e.preventDefault(); pickFile(f); }
+  });
   $('#composer').onsubmit = (e) => { e.preventDefault(); sendCurrent(); input.focus(); };
+
+  // الصور والفيديو
+  $('#attachBtn').onclick = () => $('#fileInput').click();
+  $('#fileInput').onchange = () => {
+    const f = $('#fileInput').files[0];
+    $('#fileInput').value = '';
+    if (f) pickFile(f);
+  };
+  const conv = $('#conv');
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  conv.addEventListener('dragover', (e) => { if (hasFiles(e)) { e.preventDefault(); conv.classList.add('dragging'); } });
+  conv.addEventListener('dragleave', (e) => { if (!conv.contains(e.relatedTarget)) conv.classList.remove('dragging'); });
+  conv.addEventListener('drop', (e) => {
+    conv.classList.remove('dragging');
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    const f = [...e.dataTransfer.files][0];
+    if (f && !/^(image|video)\//.test(f.type)) return toast(ERR.type, 'error');
+    pickFile(f);
+  });
 
   // الإعدادات
   $$('.segmented').forEach((s) => {
@@ -1012,7 +1567,7 @@ function bindUI() {
   $('#logoutBtn').onclick = async () => {
     const ok = await confirmDialog({
       title: 'حذف الحساب من هذا الجهاز؟',
-      text: 'سيُحذف المفتاح وجميع المحادثات من هذا المتصفح. إن لم تحفظ المفتاح الاحتياطي فلن تستطيع استعادة هذا المعرّف.',
+      text: 'سيُحذف المفتاح وجميع المحادثات والصور من هذا المتصفح. إن لم تحفظ المفتاح الاحتياطي فلن تستطيع استعادة هذا المعرّف.',
       ok: 'حذف',
       danger: true,
     });
@@ -1020,6 +1575,7 @@ function bindUI() {
     wiped = true;
     es?.close();
     Object.values(K).forEach((k) => store.del(k));
+    try { indexedDB.deleteDatabase('mrsl'); } catch {}
     location.replace(location.pathname);
   };
 
@@ -1030,9 +1586,11 @@ function bindUI() {
     if (act === 'copy-id' && me) copy(formatId(me.id), 'تم نسخ معرّفك');
     if (act === 'share' && me) shareInvite();
     if (act === 'new-chat') openDrawer('newChat');
+    if (act === 'demo' && me) openDemo();
   });
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || !$('#modal').hidden) return;
+    if (!$('#viewer').hidden) return closeViewer();
     if (!$('#convMenu').hidden) return closeMenu();
     if ($('.drawer.open')) return closeDrawers();
     if (activeId) $('#backBtn').click();
