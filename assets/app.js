@@ -1033,17 +1033,20 @@ async function botImage() {
   ctx.save();
   ctx.translate(w / 2 - 60, 130);
   ctx.scale(1.25, 1.25);
-  ctx.fillStyle = '#0c0c0d';
+  const lg = ctx.createLinearGradient(0, 0, 96, 96);
+  lg.addColorStop(0, '#7b6cff');
+  lg.addColorStop(1, '#4a3fd6');
+  ctx.fillStyle = lg;
   ctx.beginPath();
-  ctx.roundRect(0, 0, 96, 96, 28);
+  ctx.roundRect(0, 0, 96, 96, 30);
   ctx.fill();
   ctx.fillStyle = '#fff';
-  ctx.fill(new Path2D('M30 24h36a12 12 0 0 1 12 12v22a12 12 0 0 1-12 12H44l-12 10v-10h-2a12 12 0 0 1-12-12V36a12 12 0 0 1 12-12z'));
-  ctx.strokeStyle = '#0c0c0d';
+  ctx.fill(new Path2D('M48 21c15.8 0 28.5 10.8 28.5 24.2S63.8 69.4 48 69.4c-3.1 0-6-.4-8.8-1.2L27.5 75.5l2.8-10.8C23.8 60.3 19.5 53.2 19.5 45.2 19.5 31.8 32.2 21 48 21z'));
+  ctx.strokeStyle = '#5a4df0';
   ctx.lineWidth = 5.5;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.stroke(new Path2D('M33 48l7 7 13-14M47 52l3 3 13-14'));
+  ctx.stroke(new Path2D('M33.5 46l6.5 6.5L52.5 40M46.5 50.5l2 2L61 40'));
   ctx.restore();
   ctx.fillStyle = '#0c0c0d';
   ctx.textAlign = 'center';
@@ -1484,7 +1487,7 @@ function applySettings() {
   const dark = settings.theme === 'dark' || (settings.theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   document.documentElement.dataset.font = settings.fontSize;
-  $('meta[name="theme-color"]').content = dark ? '#0c0c0d' : '#ffffff';
+  $('meta[name="theme-color"]').content = dark ? '#0e0e10' : '#ffffff';
 }
 
 function syncSettingsUI() {
