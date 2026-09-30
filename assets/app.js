@@ -47,6 +47,7 @@ const DEFAULTS = {
   sound: true,
   enterSend: !matchMedia('(pointer: coarse)').matches,
   protect: true,
+  glass: 'app',
 };
 const RANK = { failed: 0, sending: 0, sent: 1, delivered: 2, read: 3 };
 const ERR = {
@@ -761,12 +762,56 @@ function dropMedia(msgs) {
   }
 }
 
+// ---------- مزايا التطبيق على iPhone ----------
+const isApp = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+// اهتزاز خفيف: Safari على iOS لا يدعم Vibration API، لكنه يهتز عند تبديل <input switch>
+// عبر الضغط على label مرتبط به (يعمل من iOS 17.4 حتى 26.4). على أندرويد نستخدم vibrate.
+let hapticLabel = null;
+function haptic() {
+  try {
+    if (!isIOS) { navigator.vibrate?.(8); return; }
+    if (!hapticLabel) {
+      const sw = document.createElement('input');
+      sw.type = 'checkbox';
+      sw.id = 'hapticSwitch';
+      sw.setAttribute('switch', '');
+      sw.tabIndex = -1;
+      sw.setAttribute('aria-hidden', 'true');
+      sw.style.cssText = 'position:fixed;left:-100px;width:1px;height:1px;opacity:0;pointer-events:none';
+      hapticLabel = document.createElement('label');
+      hapticLabel.htmlFor = sw.id;
+      hapticLabel.style.display = 'none';
+      document.body.append(sw, hapticLabel);
+    }
+    const focused = document.activeElement;
+    hapticLabel.click();
+    if (focused && focused !== document.activeElement) focused.focus({ preventScroll: true });
+  } catch {}
+}
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; });
+async function showInstall() {
+  if (installPrompt) {
+    installPrompt.prompt();
+    installPrompt = null;
+    return;
+  }
+  const steps = isIOS
+    ? 'افتح الموقع في Safari ← اضغط زر المشاركة ⬆️ ← «إضافة إلى الشاشة الرئيسية». بعدها افتح مرسال من أيقونته.'
+    : 'افتح الموقع في Chrome ← القائمة ⋮ ← «تثبيت التطبيق» أو «إضافة إلى الشاشة الرئيسية».';
+  confirmDialog({ title: 'إضافة مرسال للشاشة الرئيسية', text: steps, ok: 'تمام', cancel: '' });
+}
+
 function sendCurrent() {
   const c = state.contacts[activeId];
   if (!c || c.blocked) return;
   const text = input.value.trim();
   if (!text) return;
   if (text.length > MAX_TEXT) return toast(ERR.too_long, 'error');
+  haptic();
   input.value = '';
   drafts[activeId] = '';
   autosize();
@@ -1296,6 +1341,10 @@ function renderMe() {
 function updateTitle() {
   const total = Object.values(state.contacts).reduce((n, c) => n + (c.blocked ? 0 : c.unread || 0), 0);
   document.title = total ? `(${total}) مرسال` : 'مرسال';
+  // عدد الرسائل على أيقونة التطبيق في الشاشة الرئيسية (iOS 16.4+ يتطلب إذن الإشعارات)
+  if ('setAppBadge' in navigator) {
+    (total ? navigator.setAppBadge(total) : navigator.clearAppBadge()).catch(() => {});
+  }
 }
 
 // ---------- التنقل ----------
@@ -1351,12 +1400,12 @@ function openDrawer(name) {
 }
 function closeDrawers() { $$('.drawer.open').forEach((d) => d.classList.remove('open')); }
 
-function toggleMenu() { const m = $('#convMenu'); if (m.hidden || m.classList.contains('closing')) openEl(m); else closeEl(m); }
+function toggleMenu() { const m = $('#convMenu'); if (m.hidden || m.classList.contains('closing')) { haptic(); openEl(m); } else closeEl(m); }
 function closeMenu() { closeEl($('#convMenu')); toggleAttach(false); }
 function toggleAttach(show) {
   const m = $('#attachMenu');
   if (show === undefined) show = m.hidden || m.classList.contains('closing');
-  if (show) openEl(m); else closeEl(m);
+  if (show) { haptic(); openEl(m); } else closeEl(m);
   $('#attachBtn').setAttribute('aria-expanded', String(show));
 }
 
@@ -1487,6 +1536,11 @@ function applySettings() {
   const dark = settings.theme === 'dark' || (settings.theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   document.documentElement.dataset.font = settings.fontSize;
+  const g = settings.glass;
+  document.documentElement.classList.toggle('glass', g === 'on' || (g === 'app' && isApp()));
+  document.documentElement.classList.toggle('app-mode', isApp());
+  const ib = $('#installBtn');
+  if (ib) ib.hidden = isApp();
   $('meta[name="theme-color"]').content = dark ? '#0e0e10' : '#ffffff';
 }
 
@@ -1668,6 +1722,7 @@ function closeViewer() { const v = $('#viewer'); closeEl(v, () => { v.innerHTML 
 // ---------- حماية الوسائط ----------
 function revealProtected(mb) {
   if (!mb || mb.classList.contains('reveal')) return;
+  haptic();
   hideProtected();
   mb.classList.add('reveal');
   const v = $('video', mb);
@@ -2018,6 +2073,12 @@ function bindUI() {
   };
   $('#removeAvatar').onclick = () => { me.av = ''; me.ah = ''; saveMe(); pushAvatar(); toast('تمت إزالة الصورة'); };
   $('#passwordBtn').onclick = () => passwordDialog();
+  $('#installBtn').onclick = () => showInstall();
+  // ارتفاع شريط الكتابة العائم (في المظهر الزجاجي تمر الرسائل تحته)
+  if ('ResizeObserver' in window) {
+    new ResizeObserver(([e]) => $('#conv').style.setProperty('--composer-h', `${Math.ceil(e.target.getBoundingClientRect().height)}px`)).observe($('.composer-wrap'));
+  }
+  matchMedia('(display-mode: standalone)').addEventListener?.('change', applySettings);
   $('#signoutBtn').onclick = () => signOut();
   $('#blockedList').onclick = (e) => { const b = e.target.closest('[data-unblock]'); if (b) toggleBlock(b.dataset.unblock); };
   $('#exportKey').onclick = async () => {
@@ -2090,6 +2151,12 @@ function bindUI() {
   window.addEventListener('pagehide', saveNow);
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applySettings);
 }
+
+// ---------- منع التكبير ----------
+// Safari على iPhone يتجاهل user-scalable=no أحيانًا، فنمنع إيماءة التكبير بإصبعين
+['gesturestart', 'gesturechange', 'gestureend'].forEach((ev) => document.addEventListener(ev, (e) => e.preventDefault(), { passive: false }));
+document.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+// النقر المزدوج يمنعه touch-action: manipulation في CSS دون تأخير النقرات المتتالية
 
 // ---------- ملاءمة لوحة المفاتيح على الجوال ----------
 // iPhone لا يصغّر الصفحة عند فتح لوحة المفاتيح، فنضبط ارتفاع التطبيق على المساحة الظاهرة

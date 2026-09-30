@@ -2,7 +2,7 @@
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
   <meta name="theme-color" content="#ffffff" />
   <meta name="description" content="مرسال — رسائل خاصة مشفّرة بينك وبين أصدقائك عبر المعرّف." />
   <title>مرسال</title>
@@ -16,8 +16,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&display=swap" />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add_photo_alternate,arrow_back,block,brightness_auto,chat,check,close,content_copy,dark_mode,delete,delete_sweep,done_all,download,edit_square,error,history,hourglass_top,info,key,keyboard_return,light_mode,lock,login,logout,more_vert,notifications,palette,password,person_add,photo_camera,photo_library,refresh,schedule,search,send,settings,share,shield,smart_toy,text_fields,verified,videocam,volume_up&display=block" />
-  <link rel="stylesheet" href="assets/style.css?v=12" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add_photo_alternate,add_to_home_screen,arrow_back,block,blur_on,brightness_auto,chat,check,close,content_copy,dark_mode,delete,delete_sweep,done_all,download,edit_square,error,history,hourglass_top,info,key,keyboard_return,light_mode,lock,login,logout,more_vert,notifications,palette,password,person_add,photo_camera,photo_library,refresh,schedule,search,send,settings,share,shield,smart_toy,text_fields,verified,videocam,volume_up&display=block" />
+  <link rel="stylesheet" href="assets/style.css?v=14" />
   <script>
     // تطبيق الثيم قبل الرسم لتجنّب الوميض
     try {
@@ -25,6 +25,10 @@
       if (t === 'system') t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       document.documentElement.dataset.theme = t;
       document.documentElement.dataset.font = s.fontSize || 'm';
+      // المظهر الزجاجي: تلقائيًا عند التشغيل من الشاشة الرئيسية كتطبيق
+      var isApp = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true, g = s.glass || 'app';
+      document.documentElement.classList.toggle('app-mode', isApp);
+      document.documentElement.classList.toggle('glass', g === 'on' || (g === 'app' && isApp));
     } catch (e) {}
     // شاشة تحميل: إن تعذّر تشغيل التطبيق تظهر رسالة وزر إعادة تحميل بدل صفحة فارغة
     window.__bootFail = function () {
@@ -198,6 +202,18 @@
                 <button data-v="l" type="button">كبير</button>
               </div>
             </div>
+            <div class="row col">
+              <div class="row-label"><span class="ms">blur_on</span> المظهر الزجاجي (Liquid Glass)</div>
+              <div class="segmented" data-setting="glass">
+                <button data-v="app" type="button">في التطبيق</button>
+                <button data-v="on" type="button">دائمًا</button>
+                <button data-v="off" type="button">إيقاف</button>
+              </div>
+            </div>
+            <button class="row row-btn" id="installBtn" type="button">
+              <span class="ms">add_to_home_screen</span>
+              <span class="row-text"><b>إضافة إلى الشاشة الرئيسية</b><small>افتح مرسال كتطبيق بملء الشاشة، مع المظهر الزجاجي وعدد الرسائل على الأيقونة.</small></span>
+            </button>
           </div>
 
           <h3 class="group-title">الخصوصية</h3>
@@ -326,6 +342,6 @@
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <!-- غيّر رقم الإصدار ?v= مع كل تحديث حتى لا يخلط المتصفح ملفات قديمة بجديدة -->
-  <script type="module" src="assets/app.js?v=12"></script>
+  <script type="module" src="assets/app.js?v=14"></script>
 </body>
 </html>
