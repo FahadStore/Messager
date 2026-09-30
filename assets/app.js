@@ -47,7 +47,6 @@ const DEFAULTS = {
   sound: true,
   enterSend: !matchMedia('(pointer: coarse)').matches,
   protect: true,
-  glass: 'app',
 };
 const RANK = { failed: 0, sending: 0, sent: 1, delivered: 2, read: 3 };
 const ERR = {
@@ -1536,9 +1535,6 @@ function applySettings() {
   const dark = settings.theme === 'dark' || (settings.theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   document.documentElement.dataset.font = settings.fontSize;
-  const g = settings.glass;
-  document.documentElement.classList.toggle('glass', g === 'on' || (g === 'app' && isApp()));
-  document.documentElement.classList.toggle('app-mode', isApp());
   const ib = $('#installBtn');
   if (ib) ib.hidden = isApp();
   $('meta[name="theme-color"]').content = dark ? '#0e0e10' : '#ffffff';
@@ -2074,10 +2070,6 @@ function bindUI() {
   $('#removeAvatar').onclick = () => { me.av = ''; me.ah = ''; saveMe(); pushAvatar(); toast('تمت إزالة الصورة'); };
   $('#passwordBtn').onclick = () => passwordDialog();
   $('#installBtn').onclick = () => showInstall();
-  // ارتفاع شريط الكتابة العائم (في المظهر الزجاجي تمر الرسائل تحته)
-  if ('ResizeObserver' in window) {
-    new ResizeObserver(([e]) => $('#conv').style.setProperty('--composer-h', `${Math.ceil(e.target.getBoundingClientRect().height)}px`)).observe($('.composer-wrap'));
-  }
   matchMedia('(display-mode: standalone)').addEventListener?.('change', applySettings);
   $('#signoutBtn').onclick = () => signOut();
   $('#blockedList').onclick = (e) => { const b = e.target.closest('[data-unblock]'); if (b) toggleBlock(b.dataset.unblock); };
