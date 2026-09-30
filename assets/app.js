@@ -1931,6 +1931,10 @@ function bindUI() {
     if (row.classList.contains('failed') && !e.target.closest('a, video')) retry(m.id);
   };
   input.addEventListener('input', () => { autosize(); if (activeId) drafts[activeId] = input.value; });
+  // عند الضغط على مربع الكتابة تبقى آخر الرسائل ظاهرة فوق لوحة المفاتيح
+  input.addEventListener('focus', () => setTimeout(() => scrollToEnd(true), 120));
+  // زر الإرسال لا يسحب التركيز من مربع الكتابة، فتبقى لوحة المفاتيح مفتوحة
+  $('#sendBtn').addEventListener('mousedown', (e) => e.preventDefault());
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && settings.enterSend) {
       e.preventDefault();
@@ -2085,6 +2089,30 @@ function bindUI() {
   }, true);
   window.addEventListener('pagehide', saveNow);
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applySettings);
+}
+
+// ---------- ملاءمة لوحة المفاتيح على الجوال ----------
+// iPhone لا يصغّر الصفحة عند فتح لوحة المفاتيح، فنضبط ارتفاع التطبيق على المساحة الظاهرة
+// ونبقي آخر رسالة ظاهرة، مثل تطبيقات الدردشة.
+function scrollToEnd(smooth) {
+  const box = $('#messages');
+  if (box && activeId) box.scrollTo({ top: box.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+}
+function fitViewport() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const box = $('#messages');
+  const atEnd = box && box.scrollHeight - box.scrollTop - box.clientHeight < 90;
+  const root = document.documentElement.style;
+  root.setProperty('--app-h', `${Math.round(vv.height)}px`);
+  root.setProperty('--app-top', `${Math.round(vv.offsetTop)}px`);
+  document.body.classList.toggle('kb-open', window.innerHeight - vv.height > 120);
+  if (atEnd) requestAnimationFrame(() => scrollToEnd(false));
+}
+if (window.visualViewport) {
+  visualViewport.addEventListener('resize', fitViewport);
+  visualViewport.addEventListener('scroll', fitViewport);
+  fitViewport();
 }
 
 // ---------- البدء ----------

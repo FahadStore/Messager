@@ -277,6 +277,8 @@ textarea.input { height: auto; min-height: 110px; padding: 12px 14px; resize: ve
   display: grid;
   grid-template-columns: minmax(300px, 380px) 1fr;
   height: 100vh; height: 100dvh;
+  /* على الجوال يتبع الارتفاع المساحة الظاهرة فوق لوحة المفاتيح */
+  height: var(--app-h, 100dvh);
   overflow: hidden;
 }
 .sidebar {
@@ -1222,4 +1224,11 @@ html { text-rendering: optimizeLegibility; }
 }
 @media (display-mode: standalone) {
   .sb-head { padding-top: max(18px, env(safe-area-inset-top)); }
+}
+
+/* يبقى التطبيق مثبتًا حتى لا تُزاح الصفحة عند فتح لوحة المفاتيح */
+@media (max-width: 760px) {
+  .app { position: fixed; top: 0; left: 0; right: 0; transform: translateY(var(--app-top, 0px)); }
+  .composer-wrap { transition: padding .25s var(--ease); }
+  .kb-open .composer-wrap { padding-bottom: 8px; }
 }
