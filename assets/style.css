@@ -1228,7 +1228,16 @@ html { text-rendering: optimizeLegibility; }
 
 /* يبقى التطبيق مثبتًا حتى لا تُزاح الصفحة عند فتح لوحة المفاتيح */
 @media (max-width: 760px) {
-  .app { position: fixed; top: 0; left: 0; right: 0; transform: translateY(var(--app-top, 0px)); }
+  .app {
+    position: fixed; top: 0; left: 0; right: 0;
+    transform: translateY(var(--app-top, 0px));
+    /* نفس منحنى لوحة مفاتيح iPhone تقريبًا حتى يتحرك التطبيق معها */
+    transition: height .32s cubic-bezier(.2, .8, .2, 1), transform .32s cubic-bezier(.2, .8, .2, 1);
+  }
   .composer-wrap { transition: padding .25s var(--ease); }
   .kb-open .composer-wrap { padding-bottom: 8px; }
 }
+
+/* مربع الكتابة يكبر ويصغر بنعومة */
+.composer textarea { transition: height .18s var(--ease); }
+@media (prefers-reduced-motion: reduce) { .app, .composer textarea { transition: none !important; } }

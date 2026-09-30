@@ -2101,13 +2101,20 @@ function scrollToEnd(smooth) {
 function fitViewport() {
   const vv = window.visualViewport;
   if (!vv) return;
-  const box = $('#messages');
-  const atEnd = box && box.scrollHeight - box.scrollTop - box.clientHeight < 90;
   const root = document.documentElement.style;
   root.setProperty('--app-h', `${Math.round(vv.height)}px`);
   root.setProperty('--app-top', `${Math.round(vv.offsetTop)}px`);
   document.body.classList.toggle('kb-open', window.innerHeight - vv.height > 120);
-  if (atEnd) requestAnimationFrame(() => scrollToEnd(false));
+}
+
+// تبقى آخر رسالة ملتصقة بالأسفل طوال حركة تغيّر الحجم (لوحة المفاتيح، كبر مربع الكتابة)
+let stickToEnd = true;
+{
+  const box = $('#messages');
+  box.addEventListener('scroll', () => { stickToEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 90; }, { passive: true });
+  if ('ResizeObserver' in window) {
+    new ResizeObserver(() => { if (stickToEnd && activeId) box.scrollTop = box.scrollHeight; }).observe(box);
+  }
 }
 if (window.visualViewport) {
   visualViewport.addEventListener('resize', fitViewport);
