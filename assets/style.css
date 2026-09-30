@@ -1127,3 +1127,50 @@ button.mb-state { cursor: pointer; font: inherit; color: #fff; }
   .conv-head { min-height: 58px; }
   .chat-item.active::before { display: none; }
 }
+
+/* ===== سلاسة إضافية ===== */
+html { text-rendering: optimizeLegibility; }
+
+/* تمرير أنعم وأداء أفضل في المحادثات الطويلة */
+.chat-list, .drawer-body { scroll-behavior: smooth; }
+.messages, .chat-list, .drawer-body { scrollbar-gutter: stable; -webkit-overflow-scrolling: touch; }
+
+/* تفاعل خفيف مع الفقاعات */
+@media (hover: hover) {
+  .bubble { transition: transform .35s var(--ease), box-shadow .35s var(--ease); }
+  .msg:hover .bubble { transform: translateY(-1px); }
+  .msg.in:hover .bubble { box-shadow: 0 0 0 1px var(--bubble-in-line), 0 6px 18px -10px rgba(0, 0, 0, .25); }
+  .btn:not(:disabled):hover { transform: translateY(-1px); }
+  .icon-btn:hover .ms { transform: scale(1.08); }
+  .chat-item:hover:not(.active) { background: color-mix(in srgb, var(--bg-2) 80%, var(--bg-3)); }
+}
+.icon-btn .ms, .attach-btn .ms { transition: transform .35s var(--spring); }
+.icon-btn:active .ms { transform: scale(.88); }
+.btn { transition: transform .3s var(--spring), background-color .25s var(--ease), opacity .25s var(--ease), box-shadow .3s var(--ease); }
+.btn-primary:not(:disabled):hover { box-shadow: 0 8px 20px -10px rgba(0, 0, 0, .45); opacity: 1; }
+
+/* شريط الكتابة: عنصر نائب يتلاشى بنعومة */
+.composer textarea::placeholder { transition: opacity .25s var(--ease), transform .25s var(--ease); }
+.composer textarea:focus::placeholder { opacity: .55; transform: translateX(-4px); }
+
+/* شارة غير المقروء تنبض مرة عند الظهور */
+.chat-item.unread .badge { animation: pop .45s var(--spring), badgePulse 1.8s var(--ease) .45s 1; }
+@keyframes badgePulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ink) 35%, transparent); } 100% { box-shadow: 0 0 0 8px transparent; } }
+
+/* الأدراج والقوائم: عمق أوضح */
+.drawer.open { box-shadow: -12px 0 40px -24px rgba(0, 0, 0, .35); }
+.menu, .attach-menu { backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); background: color-mix(in srgb, var(--bg) 92%, transparent); }
+.menu button, .am-item { transition: background-color .2s var(--ease), transform .25s var(--spring); }
+.menu button:active, .am-item:active { transform: scale(.97); }
+
+/* رأس المحادثة أكثر شفافية وأنعم */
+.conv-head { background: color-mix(in srgb, var(--bg) 78%, transparent); backdrop-filter: saturate(1.6) blur(20px); -webkit-backdrop-filter: saturate(1.6) blur(20px); }
+
+/* مفاتيح التبديل والتبويبات بحركة نابضة */
+.switch::after { transition: transform .4s var(--spring), background-color .25s var(--ease); }
+.segmented button { transition: background-color .3s var(--ease), color .3s var(--ease), box-shadow .3s var(--ease), transform .3s var(--spring); }
+.segmented button:active { transform: scale(.96); }
+
+/* الصور تظهر بتلاشٍ ناعم مع تكبير خفيف */
+.mb-full { transform: scale(1.02); transition: opacity .45s var(--ease), transform .6s var(--ease); }
+.mb-full.loaded { transform: none; }
